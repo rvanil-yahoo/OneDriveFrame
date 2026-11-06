@@ -1,7 +1,5 @@
 #include "OneDriveFrameApp.h"
 
-#include <SD.h>
-
 #include "FrameConfig.h"
 
 namespace odf {
@@ -10,10 +8,7 @@ void OneDriveFrameApp::setup() {
   Serial.begin(115200);
   delay(1000);
   printBootBanner();
-
-  if (!SD.begin(kSdChipSelectPin)) {
-    Serial.println("[Storage] SD card not ready at boot; will retry later.");
-  }
+  Serial.println("[Storage] SD mount deferred until sync phase.");
 }
 
 void OneDriveFrameApp::loop() {
@@ -78,7 +73,7 @@ void OneDriveFrameApp::loop() {
 
     case AppState::kListOneDriveFolder:
       logStateTransition("LIST_ONEDRIVE_FOLDER");
-      if (graphClient_.listFolder()) {
+      if (graphClient_.listFolder(token_)) {
         state_ = AppState::kDownloadNewPhotos;
       } else {
         state_ = AppState::kDisplaySlideshow;
@@ -93,7 +88,7 @@ void OneDriveFrameApp::loop() {
         break;
       }
 
-      if (graphClient_.downloadNewestPhotos()) {
+      if (graphClient_.downloadNewestPhotos(token_)) {
         state_ = AppState::kPruneOldPhotos;
       } else {
         state_ = AppState::kDisplaySlideshow;

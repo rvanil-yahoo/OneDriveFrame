@@ -14,6 +14,12 @@ constexpr const char* kPhotoDirectory = "/photos";
 constexpr const char* kConfigPortalName = "OneDriveFrame Setup";
 constexpr const char* kConfigPortalPassword = "oneframe";
 constexpr uint8_t kSdChipSelectPin = 10;
+constexpr uint8_t kSdMosiPin = 11;
+constexpr uint8_t kSdClockPin = 12;
+constexpr uint8_t kSdMisoPin = 13;
+constexpr uint8_t kRtpChipSelectPin = 38;
+constexpr uint32_t kSdSpiFrequencyHz = 4000000UL;
+constexpr bool kSdFormatIfEmpty = true;
 constexpr uint32_t kWifiConnectTimeoutMs = 20000UL;
 constexpr uint32_t kWifiPortalTimeoutMs = 300000UL;
 
@@ -23,7 +29,7 @@ constexpr uint32_t kMaxLocalUsageBytes = 4UL * 1024UL * 1024UL * 1024UL;
 constexpr uint32_t kDefaultDeviceCodePollMs = 5000UL;
 
 #ifndef CLIENT_ID
-#define CLIENT_ID "00000000-0000-0000-0000-000000000000"
+#define CLIENT_ID "e29eee94-f016-4d63-9796-e57d83276541"
 #endif
 
 }  // namespace odf

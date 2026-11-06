@@ -2,6 +2,7 @@
 
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <SD.h>
 #include <WiFiClientSecure.h>
 
 #include "FrameConfig.h"
@@ -11,6 +12,7 @@ namespace odf {
 namespace {
 
 constexpr const char* kPlaceholderClientId = "00000000-0000-0000-0000-000000000000";
+constexpr size_t kHttpBufferSize = 2048;
 
 String urlEncode(const String& value) {
   String encoded;
@@ -89,20 +91,255 @@ bool isClientIdConfigured() {
   return String(CLIENT_ID) != String(kPlaceholderClientId);
 }
 
-}  // namespace
+bool isAllowedImage(const String& name) {
+  String lower = name;
+  lower.toLowerCase();
+  return lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png");
+}
 
-bool GraphClient::listFolder() {
-  Serial.println("[Graph] Listing OneDrive folder: " + String(kOneDriveFolderName));
-  Serial.print("[Graph] Endpoint: ");
-  Serial.println(String(kGraphBaseUrl) + "/me/drive/root:/" + kOneDriveFolderName + ":/children");
-  Serial.println("[Graph] Stub: implement Microsoft Graph HTTP request and parse JSON here.");
+String sanitizeFilename(const String& name) {
+  String out;
+  out.reserve(name.length());
+  for (size_t i = 0; i < name.length(); ++i) {
+    char c = name[i];
+    if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+      out += '_';
+    } else {
+      out += c;
+    }
+  }
+  if (out.length() == 0) {
+    out = "photo.jpg";
+  }
+  return out;
+}
+
+bool getWithBearer(const String& url, const String& token, int& statusCode, String& responseBody) {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  if (!http.begin(client, url)) {
+    Serial.println("[Graph] Failed to initialize HTTPS client.");
+    return false;
+  }
+
+  http.setTimeout(15000);
+  http.setConnectTimeout(10000);
+  http.setReuse(false);
+  http.useHTTP10(true);
+  http.addHeader("Authorization", "Bearer " + token);
+  http.addHeader("Accept", "application/json");
+
+  statusCode = http.GET();
+  responseBody = http.getString();
+  http.end();
+
+  if (statusCode <= 0) {
+    Serial.print("[Graph] HTTPS request failed: ");
+    Serial.println(statusCode);
+    return false;
+  }
+
   return true;
 }
 
-bool GraphClient::downloadNewestPhotos() {
+}  // namespace
+
+bool GraphClient::listFolder(const OAuthToken& token) {
+  pendingPhotoCount_ = 0;
+  if (token.accessToken.isEmpty()) {
+    Serial.println("[Graph] Missing access token.");
+    return false;
+  }
+
+  Serial.println("[Graph] Listing OneDrive folder: " + String(kOneDriveFolderName));
+  String endpoint = String(kGraphBaseUrl) + "/me/drive/root:/" + urlEncode(String(kOneDriveFolderName)) + ":/children";
+  endpoint += "?$select=name,size,lastModifiedDateTime,file,@microsoft.graph.downloadUrl";
+
+  int statusCode = 0;
+  String responseBody;
+  if (!getWithBearer(endpoint, token.accessToken, statusCode, responseBody)) {
+    return false;
+  }
+
+  if (statusCode != 200) {
+    Serial.print("[Graph] Folder listing failed with HTTP status ");
+    Serial.println(statusCode);
+    Serial.println(responseBody);
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError parseErr = deserializeJson(doc, responseBody);
+  if (parseErr) {
+    Serial.print("[Graph] Failed to parse folder list JSON: ");
+    Serial.println(parseErr.c_str());
+    return false;
+  }
+
+  JsonArray items = doc["value"].as<JsonArray>();
+  if (items.isNull()) {
+    Serial.println("[Graph] Folder list missing 'value' array.");
+    return false;
+  }
+
+  for (JsonVariant item : items) {
+    const bool isFile = !item["file"].isNull();
+    const String name = item["name"] | "";
+    const String downloadUrl = item["@microsoft.graph.downloadUrl"] | "";
+    const String modified = item["lastModifiedDateTime"] | "";
+    const uint32_t sizeBytes = item["size"] | 0U;
+
+    if (!isFile || !isAllowedImage(name) || downloadUrl.isEmpty() || modified.isEmpty()) {
+      continue;
+    }
+
+    if (pendingPhotoCount_ >= (sizeof(pendingPhotos_) / sizeof(pendingPhotos_[0]))) {
+      continue;
+    }
+
+    pendingPhotos_[pendingPhotoCount_].name = name;
+    pendingPhotos_[pendingPhotoCount_].downloadUrl = downloadUrl;
+    pendingPhotos_[pendingPhotoCount_].modifiedUtc = modified;
+    pendingPhotos_[pendingPhotoCount_].sizeBytes = sizeBytes;
+    ++pendingPhotoCount_;
+  }
+
+  for (size_t i = 1; i < pendingPhotoCount_; ++i) {
+    PendingPhoto key = pendingPhotos_[i];
+    size_t j = i;
+    while (j > 0 && pendingPhotos_[j - 1].modifiedUtc < key.modifiedUtc) {
+      pendingPhotos_[j] = pendingPhotos_[j - 1];
+      --j;
+    }
+    pendingPhotos_[j] = key;
+  }
+
+  Serial.print("[Graph] Queued image files: ");
+  Serial.println(pendingPhotoCount_);
+  return pendingPhotoCount_ > 0;
+}
+
+bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
+  if (token.accessToken.isEmpty()) {
+    Serial.println("[Graph] Missing access token for download.");
+    return false;
+  }
+
+  if (pendingPhotoCount_ == 0) {
+    Serial.println("[Graph] No queued photos to download.");
+    return true;
+  }
+
   Serial.println("[Graph] Downloading newest photos that fit within the quota.");
-  Serial.println("[Graph] Stub: implement file-by-file Graph download and SD write logic here.");
-  return true;
+
+  size_t successCount = 0;
+  for (size_t i = 0; i < pendingPhotoCount_; ++i) {
+    const PendingPhoto& photo = pendingPhotos_[i];
+    const String filePath = String(kPhotoDirectory) + "/" + sanitizeFilename(photo.name);
+
+    if (SD.exists(filePath)) {
+      File existing = SD.open(filePath, FILE_READ);
+      if (existing && existing.size() == photo.sizeBytes) {
+        existing.close();
+        Serial.println("[Graph] Skipping unchanged file: " + photo.name);
+        ++successCount;
+        continue;
+      }
+      if (existing) {
+        existing.close();
+      }
+      SD.remove(filePath);
+    }
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    if (!http.begin(client, photo.downloadUrl)) {
+      Serial.println("[Graph] Failed to start download request for: " + photo.name);
+      continue;
+    }
+
+    http.setTimeout(20000);
+    http.setConnectTimeout(10000);
+    http.setReuse(false);
+    http.useHTTP10(true);
+    http.setUserAgent("OneDriveFrame/0.1");
+    http.addHeader("Accept", "application/octet-stream");
+
+    const int statusCode = http.GET();
+    if (statusCode != 200) {
+      Serial.print("[Graph] Download failed for ");
+      Serial.print(photo.name);
+      Serial.print(" with HTTP ");
+      Serial.println(statusCode);
+      http.end();
+      continue;
+    }
+
+    File outFile = SD.open(filePath, FILE_WRITE);
+    if (!outFile) {
+      Serial.println("[Graph] Failed to open SD file for write: " + filePath);
+      http.end();
+      continue;
+    }
+
+    auto* stream = http.getStreamPtr();
+    uint8_t buffer[kHttpBufferSize];
+    int remaining = http.getSize();
+    size_t written = 0;
+    uint32_t idleLoops = 0;
+
+    while (http.connected() && (remaining > 0 || remaining == -1)) {
+      const size_t available = stream->available();
+      if (available > 0) {
+        const size_t toRead = available > sizeof(buffer) ? sizeof(buffer) : available;
+        const int readBytes = stream->readBytes(buffer, toRead);
+        if (readBytes > 0) {
+          outFile.write(buffer, static_cast<size_t>(readBytes));
+          written += static_cast<size_t>(readBytes);
+          if (remaining > 0) {
+            remaining -= readBytes;
+          }
+          idleLoops = 0;
+        }
+      } else {
+        delay(1);
+        ++idleLoops;
+        if (idleLoops > 20000) {
+          break;
+        }
+      }
+    }
+
+    outFile.close();
+    http.end();
+
+    if (photo.sizeBytes > 0 && written != photo.sizeBytes) {
+      Serial.print("[Graph] Incomplete download for ");
+      Serial.print(photo.name);
+      Serial.print(". expected=");
+      Serial.print(photo.sizeBytes);
+      Serial.print(" written=");
+      Serial.println(written);
+      SD.remove(filePath);
+      continue;
+    }
+
+    Serial.print("[Graph] Saved ");
+    Serial.print(photo.name);
+    Serial.print(" (");
+    Serial.print(written);
+    Serial.println(" bytes)");
+    ++successCount;
+  }
+
+  Serial.print("[Graph] Downloaded files this sync: ");
+  Serial.print(successCount);
+  Serial.print("/");
+  Serial.println(pendingPhotoCount_);
+  return successCount > 0;
 }
 
 bool GraphClient::refreshAccessToken(OAuthToken& token) {

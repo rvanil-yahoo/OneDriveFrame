@@ -10,6 +10,9 @@ class PhotoStorage {
   uint64_t currentUsageBytes() const;
   bool pruneOldestPhotos();
   void displaySlideshow();
+
+ private:
+  bool isMounted_ = false;
 };
 
 }  // namespace odf
