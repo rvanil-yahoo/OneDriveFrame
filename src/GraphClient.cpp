@@ -233,6 +233,10 @@ bool GraphClient::listFolder(const OAuthToken& token) {
     Serial.println("[Graph] Folder list missing 'value' array.");
     return false;
   }
+  if (!catalog_.beginRemoteSync()) {
+    Serial.println("[Graph] Failed to reset remote catalog presence flags.");
+    return false;
+  }
 
   size_t totalChildren = 0;
   size_t totalFiles = 0;

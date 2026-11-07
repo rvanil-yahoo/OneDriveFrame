@@ -21,8 +21,12 @@ class PhotoCatalog {
 
   bool begin();
   bool reconcileWithStorage();
+  bool beginRemoteSync();
   bool upsertRemotePhoto(const RemotePhotoMetadata& metadata);
   bool markDownloaded(const String& itemId, const String& filename, const String& localPath, uint32_t sizeBytes);
+  bool removeFilesNotInRemoteCatalog(size_t& deletedCount, uint64_t& freedBytes);
+  bool pruneOldestLocalFilesToQuota(uint64_t quotaBytes, size_t& deletedCount, uint64_t& deletedBytes);
+  uint64_t totalLocalBytes();
 
  private:
   bool openDatabase();

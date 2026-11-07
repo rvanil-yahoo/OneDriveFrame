@@ -21,6 +21,27 @@ bool bindNullableText(sqlite3_stmt* stmt, int index, const String& value) {
   return sqlite3_bind_text(stmt, index, value.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK;
 }
 
+bool hasColumn(sqlite3* db, const char* tableName, const char* columnName) {
+  String sql = "PRAGMA table_info(" + String(tableName) + ");";
+  sqlite3_stmt* stmt = nullptr;
+  int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) {
+    return false;
+  }
+
+  bool found = false;
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    const char* name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+    if (name != nullptr && strcmp(name, columnName) == 0) {
+      found = true;
+      break;
+    }
+  }
+
+  sqlite3_finalize(stmt);
+  return found;
+}
+
 void logSqliteError(const char* context, sqlite3* db, int rc) {
   Serial.print("[Catalog] ");
   Serial.print(context);
@@ -95,6 +116,7 @@ bool PhotoCatalog::createSchema() {
       "last_modified_utc TEXT,"
       "etag TEXT,"
       "mime_type TEXT,"
+      "remote_present INTEGER NOT NULL DEFAULT 0,"
       "local_present INTEGER NOT NULL DEFAULT 0,"
       "downloaded_utc TEXT"
       ");"
@@ -102,7 +124,34 @@ bool PhotoCatalog::createSchema() {
       "CREATE INDEX IF NOT EXISTS idx_photos_last_modified ON photos(last_modified_utc);"
       "CREATE INDEX IF NOT EXISTS idx_photos_local_present ON photos(local_present);"
       "CREATE INDEX IF NOT EXISTS idx_photos_size ON photos(size_bytes);";
-  return execute(kSchemaSql);
+  if (!execute(kSchemaSql)) {
+    return false;
+  }
+
+  sqlite3* db = nullptr;
+  int rc = sqlite3_open(kCatalogPath, &db);
+  if (rc != SQLITE_OK) {
+    if (db != nullptr) {
+      sqlite3_close(db);
+    }
+    return false;
+  }
+
+  if (!hasColumn(db, "photos", "remote_present")) {
+    char* errorMessage = nullptr;
+    rc = sqlite3_exec(db, "ALTER TABLE photos ADD COLUMN remote_present INTEGER NOT NULL DEFAULT 0;", nullptr, nullptr,
+                      &errorMessage);
+    if (rc != SQLITE_OK) {
+      if (errorMessage != nullptr) {
+        sqlite3_free(errorMessage);
+      }
+      sqlite3_close(db);
+      return false;
+    }
+  }
+
+  sqlite3_close(db);
+  return true;
 }
 
 bool PhotoCatalog::begin() {
@@ -209,6 +258,13 @@ bool PhotoCatalog::reconcileWithStorage() {
   return true;
 }
 
+bool PhotoCatalog::beginRemoteSync() {
+  if (!initialized_ && !begin()) {
+    return false;
+  }
+  return execute("UPDATE photos SET remote_present = 0 WHERE item_id IS NOT NULL;");
+}
+
 bool PhotoCatalog::upsertRemotePhoto(const RemotePhotoMetadata& metadata) {
   if (!initialized_ && !begin()) {
     return false;
@@ -227,7 +283,7 @@ bool PhotoCatalog::upsertRemotePhoto(const RemotePhotoMetadata& metadata) {
 
   const char* updateSql =
       "UPDATE photos SET filename=?, local_path=?, size_bytes=?, width=?, height=?, orientation=?, "
-      "last_modified_utc=?, etag=?, mime_type=? WHERE item_id=?;";
+      "last_modified_utc=?, etag=?, mime_type=?, remote_present=1 WHERE item_id=?;";
   sqlite3_stmt* updateStmt = nullptr;
   rc = sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nullptr);
   if (rc != SQLITE_OK) {
@@ -266,7 +322,7 @@ bool PhotoCatalog::upsertRemotePhoto(const RemotePhotoMetadata& metadata) {
   if (sqlite3_changes(db) == 0) {
     const char* insertSql =
         "INSERT INTO photos(item_id, filename, local_path, size_bytes, width, height, orientation, "
-        "last_modified_utc, etag, mime_type, local_present) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0);";
+        "last_modified_utc, etag, mime_type, remote_present, local_present) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0);";
     sqlite3_stmt* insertStmt = nullptr;
     rc = sqlite3_prepare_v2(db, insertSql, -1, &insertStmt, nullptr);
     if (rc != SQLITE_OK) {
@@ -367,6 +423,174 @@ bool PhotoCatalog::markDownloaded(const String& itemId, const String& filename, 
     }
   }
 
+  sqlite3_close(db);
+  return true;
+}
+
+bool PhotoCatalog::removeFilesNotInRemoteCatalog(size_t& deletedCount, uint64_t& freedBytes) {
+  deletedCount = 0;
+  freedBytes = 0;
+  if (!initialized_ && !begin()) {
+    return false;
+  }
+
+  sqlite3* db = nullptr;
+  int rc = sqlite3_open(kCatalogPath, &db);
+  if (rc != SQLITE_OK) {
+    if (db != nullptr) {
+      sqlite3_close(db);
+    }
+    return false;
+  }
+
+  const char* selectSql =
+      "SELECT id, local_path, size_bytes, item_id FROM photos "
+      "WHERE local_present = 1 AND (item_id IS NULL OR remote_present = 0);";
+  sqlite3_stmt* stmt = nullptr;
+  rc = sqlite3_prepare_v2(db, selectSql, -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) {
+    sqlite3_close(db);
+    return false;
+  }
+
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    const int64_t rowId = sqlite3_column_int64(stmt, 0);
+    const char* localPathText = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+    const uint64_t sizeBytes = static_cast<uint64_t>(sqlite3_column_int64(stmt, 2));
+    const bool hasItemId = sqlite3_column_type(stmt, 3) != SQLITE_NULL;
+    if (localPathText == nullptr) {
+      continue;
+    }
+    const String localPath(localPathText);
+    if (localPath.endsWith("/catalog.db")) {
+      continue;
+    }
+
+    if (SD.exists(localPath) && SD.remove(localPath)) {
+      ++deletedCount;
+      freedBytes += sizeBytes;
+    }
+
+    sqlite3_stmt* updateStmt = nullptr;
+    rc = sqlite3_prepare_v2(db, "UPDATE photos SET local_present=0 WHERE id=?;", -1, &updateStmt, nullptr);
+    if (rc == SQLITE_OK) {
+      sqlite3_bind_int64(updateStmt, 1, rowId);
+      sqlite3_step(updateStmt);
+      sqlite3_finalize(updateStmt);
+    } else if (updateStmt != nullptr) {
+      sqlite3_finalize(updateStmt);
+    }
+
+    if (!hasItemId) {
+      sqlite3_stmt* deleteStmt = nullptr;
+      rc = sqlite3_prepare_v2(db, "DELETE FROM photos WHERE id=?;", -1, &deleteStmt, nullptr);
+      if (rc == SQLITE_OK) {
+        sqlite3_bind_int64(deleteStmt, 1, rowId);
+        sqlite3_step(deleteStmt);
+        sqlite3_finalize(deleteStmt);
+      } else if (deleteStmt != nullptr) {
+        sqlite3_finalize(deleteStmt);
+      }
+    }
+  }
+
+  sqlite3_finalize(stmt);
+  sqlite3_close(db);
+  return true;
+}
+
+uint64_t PhotoCatalog::totalLocalBytes() {
+  if (!initialized_ && !begin()) {
+    return 0;
+  }
+
+  sqlite3* db = nullptr;
+  int rc = sqlite3_open(kCatalogPath, &db);
+  if (rc != SQLITE_OK) {
+    if (db != nullptr) {
+      sqlite3_close(db);
+    }
+    return 0;
+  }
+
+  sqlite3_stmt* stmt = nullptr;
+  rc = sqlite3_prepare_v2(db, "SELECT COALESCE(SUM(size_bytes),0) FROM photos WHERE local_present=1;", -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) {
+    sqlite3_close(db);
+    return 0;
+  }
+
+  uint64_t total = 0;
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    total = static_cast<uint64_t>(sqlite3_column_int64(stmt, 0));
+  }
+  sqlite3_finalize(stmt);
+  sqlite3_close(db);
+  return total;
+}
+
+bool PhotoCatalog::pruneOldestLocalFilesToQuota(uint64_t quotaBytes, size_t& deletedCount, uint64_t& deletedBytes) {
+  deletedCount = 0;
+  deletedBytes = 0;
+  if (!initialized_ && !begin()) {
+    return false;
+  }
+
+  uint64_t usage = totalLocalBytes();
+  if (usage <= quotaBytes) {
+    return true;
+  }
+
+  sqlite3* db = nullptr;
+  int rc = sqlite3_open(kCatalogPath, &db);
+  if (rc != SQLITE_OK) {
+    if (db != nullptr) {
+      sqlite3_close(db);
+    }
+    return false;
+  }
+
+  const char* selectSql =
+      "SELECT id, local_path, size_bytes FROM photos "
+      "WHERE local_present=1 "
+      "ORDER BY CASE WHEN last_modified_utc IS NULL THEN 1 ELSE 0 END, last_modified_utc ASC, id ASC;";
+  sqlite3_stmt* stmt = nullptr;
+  rc = sqlite3_prepare_v2(db, selectSql, -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) {
+    sqlite3_close(db);
+    return false;
+  }
+
+  while (usage > quotaBytes && sqlite3_step(stmt) == SQLITE_ROW) {
+    const int64_t rowId = sqlite3_column_int64(stmt, 0);
+    const char* localPathText = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+    const uint64_t sizeBytes = static_cast<uint64_t>(sqlite3_column_int64(stmt, 2));
+    if (localPathText == nullptr) {
+      continue;
+    }
+    const String localPath(localPathText);
+    if (localPath.endsWith("/catalog.db")) {
+      continue;
+    }
+
+    if (SD.exists(localPath) && SD.remove(localPath)) {
+      ++deletedCount;
+      deletedBytes += sizeBytes;
+      usage = usage > sizeBytes ? usage - sizeBytes : 0;
+    }
+
+    sqlite3_stmt* updateStmt = nullptr;
+    rc = sqlite3_prepare_v2(db, "UPDATE photos SET local_present=0 WHERE id=?;", -1, &updateStmt, nullptr);
+    if (rc == SQLITE_OK) {
+      sqlite3_bind_int64(updateStmt, 1, rowId);
+      sqlite3_step(updateStmt);
+      sqlite3_finalize(updateStmt);
+    } else if (updateStmt != nullptr) {
+      sqlite3_finalize(updateStmt);
+    }
+  }
+
+  sqlite3_finalize(stmt);
   sqlite3_close(db);
   return true;
 }

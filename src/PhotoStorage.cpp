@@ -102,34 +102,49 @@ bool PhotoStorage::begin() {
 }
 
 uint64_t PhotoStorage::currentUsageBytes() const {
-  File root = SD.open(kPhotoDirectory);
-  if (!root || !root.isDirectory()) {
-    return 0;
-  }
-
-  uint64_t total = 0;
-  File entry = root.openNextFile();
-  while (entry) {
-    if (!entry.isDirectory()) {
-      total += entry.size();
-    }
-    entry.close();
-    entry = root.openNextFile();
-  }
-  root.close();
-  return total;
+  return const_cast<PhotoCatalog&>(catalog_).totalLocalBytes();
 }
 
 bool PhotoStorage::pruneOldestPhotos() {
+  size_t removedStaleCount = 0;
+  uint64_t removedStaleBytes = 0;
+  if (!catalog_.removeFilesNotInRemoteCatalog(removedStaleCount, removedStaleBytes)) {
+    Serial.println("[Storage] Failed to prune files missing from remote catalog.");
+    return false;
+  }
+
+  if (removedStaleCount > 0) {
+    Serial.print("[Storage] Removed files not in remote catalog: ");
+    Serial.print(removedStaleCount);
+    Serial.print(" (");
+    Serial.print(removedStaleBytes);
+    Serial.println(" bytes)");
+  }
+
   const uint64_t usage = currentUsageBytes();
-  if (usage < kMaxLocalUsageBytes) {
+  if (usage <= kMaxLocalUsageBytes) {
     Serial.println("[Storage] Current usage is within quota.");
     return true;
   }
 
-  Serial.println("[Storage] Pruning local photos to stay under the configured quota.");
-  Serial.println("[Storage] Stub: implement age-based deletion of the oldest local files here.");
-  return true;
+  size_t removedQuotaCount = 0;
+  uint64_t removedQuotaBytes = 0;
+  if (!catalog_.pruneOldestLocalFilesToQuota(kMaxLocalUsageBytes, removedQuotaCount, removedQuotaBytes)) {
+    Serial.println("[Storage] Failed to prune oldest local files to quota.");
+    return false;
+  }
+
+  if (removedQuotaCount > 0) {
+    Serial.print("[Storage] Removed oldest files for quota: ");
+    Serial.print(removedQuotaCount);
+    Serial.print(" (");
+    Serial.print(removedQuotaBytes);
+    Serial.println(" bytes)");
+  } else {
+    Serial.println("[Storage] Quota exceeded but no eligible files were pruned.");
+  }
+
+  return currentUsageBytes() <= kMaxLocalUsageBytes;
 }
 
 void PhotoStorage::displaySlideshow() {
