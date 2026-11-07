@@ -36,6 +36,7 @@ String urlEncode(const String& value) {
 bool postForm(const String& url, const String& formBody, int& statusCode, String& responseBody) {
   WiFiClientSecure client;
   client.setInsecure();
+  client.setTimeout(15000);
 
   HTTPClient http;
   if (!http.begin(client, url)) {
@@ -43,6 +44,11 @@ bool postForm(const String& url, const String& formBody, int& statusCode, String
     return false;
   }
 
+  http.setTimeout(15000);
+  http.setConnectTimeout(10000);
+  http.setReuse(false);
+  http.useHTTP10(true);
+  http.addHeader("Connection", "close");
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
   statusCode = http.POST(formBody);
   responseBody = http.getString();
@@ -117,6 +123,7 @@ String sanitizeFilename(const String& name) {
 bool getWithBearer(const String& url, const String& token, int& statusCode, String& responseBody) {
   WiFiClientSecure client;
   client.setInsecure();
+  client.setTimeout(15000);
 
   HTTPClient http;
   if (!http.begin(client, url)) {
@@ -128,6 +135,7 @@ bool getWithBearer(const String& url, const String& token, int& statusCode, Stri
   http.setConnectTimeout(10000);
   http.setReuse(false);
   http.useHTTP10(true);
+  http.addHeader("Connection", "close");
   http.addHeader("Authorization", "Bearer " + token);
   http.addHeader("Accept", "application/json");
 
@@ -144,18 +152,57 @@ bool getWithBearer(const String& url, const String& token, int& statusCode, Stri
   return true;
 }
 
+bool fetchDownloadUrlForItem(const String& itemId, const String& accessToken, String& downloadUrl) {
+  const String endpoint =
+      String(kGraphBaseUrl) + "/me/drive/items/" + urlEncode(itemId) + "?select=id,name,@microsoft.graph.downloadUrl";
+
+  int statusCode = 0;
+  String responseBody;
+  if (!getWithBearer(endpoint, accessToken, statusCode, responseBody)) {
+    return false;
+  }
+
+  if (statusCode != 200) {
+    Serial.print("[Graph] Item details request failed with HTTP ");
+    Serial.println(statusCode);
+    Serial.println(responseBody);
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError parseErr = deserializeJson(doc, responseBody);
+  if (parseErr) {
+    Serial.print("[Graph] Failed to parse item details JSON: ");
+    Serial.println(parseErr.c_str());
+    return false;
+  }
+
+  downloadUrl = doc["@microsoft.graph.downloadUrl"] | "";
+  if (downloadUrl.isEmpty()) {
+    Serial.println("[Graph] Item details missing @microsoft.graph.downloadUrl.");
+    return false;
+  }
+
+  return true;
+}
+
 }  // namespace
 
 bool GraphClient::listFolder(const OAuthToken& token) {
+  authFailure_ = false;
   pendingPhotoCount_ = 0;
   if (token.accessToken.isEmpty()) {
     Serial.println("[Graph] Missing access token.");
     return false;
   }
+  if (!catalog_.begin()) {
+    Serial.println("[Graph] Failed to initialize photo catalog.");
+    return false;
+  }
 
   Serial.println("[Graph] Listing OneDrive folder: " + String(kOneDriveFolderName));
   String endpoint = String(kGraphBaseUrl) + "/me/drive/root:/" + urlEncode(String(kOneDriveFolderName)) + ":/children";
-  endpoint += "?$select=name,size,lastModifiedDateTime,file,@microsoft.graph.downloadUrl";
+  endpoint += "?$top=200";
 
   int statusCode = 0;
   String responseBody;
@@ -167,6 +214,9 @@ bool GraphClient::listFolder(const OAuthToken& token) {
     Serial.print("[Graph] Folder listing failed with HTTP status ");
     Serial.println(statusCode);
     Serial.println(responseBody);
+    if (statusCode == 401) {
+      authFailure_ = true;
+    }
     return false;
   }
 
@@ -184,24 +234,61 @@ bool GraphClient::listFolder(const OAuthToken& token) {
     return false;
   }
 
+  size_t totalChildren = 0;
+  size_t totalFiles = 0;
+  size_t totalImages = 0;
+  size_t cataloged = 0;
+
   for (JsonVariant item : items) {
+    ++totalChildren;
     const bool isFile = !item["file"].isNull();
     const String name = item["name"] | "";
-    const String downloadUrl = item["@microsoft.graph.downloadUrl"] | "";
+    const String itemId = item["id"] | "";
     const String modified = item["lastModifiedDateTime"] | "";
     const uint32_t sizeBytes = item["size"] | 0U;
+    const String etag = item["eTag"] | "";
+    const String mimeType = item["file"]["mimeType"] | "";
+    const int32_t width = item["image"]["width"] | -1;
+    const int32_t height = item["image"]["height"] | -1;
+    const String orientation = item["photo"]["orientation"] | "";
+    if (isFile) {
+      ++totalFiles;
+    }
 
-    if (!isFile || !isAllowedImage(name) || downloadUrl.isEmpty() || modified.isEmpty()) {
+    if (!isFile || !isAllowedImage(name) || modified.isEmpty() || itemId.isEmpty()) {
       continue;
     }
+
+    ++totalImages;
 
     if (pendingPhotoCount_ >= (sizeof(pendingPhotos_) / sizeof(pendingPhotos_[0]))) {
       continue;
     }
 
+    const String localPath = String(kPhotoDirectory) + "/" + sanitizeFilename(name);
+    PhotoCatalog::RemotePhotoMetadata metadata;
+    metadata.itemId = itemId;
+    metadata.filename = name;
+    metadata.localPath = localPath;
+    metadata.modifiedUtc = modified;
+    metadata.etag = etag;
+    metadata.mimeType = mimeType;
+    metadata.width = width;
+    metadata.height = height;
+    metadata.orientation = orientation;
+    metadata.sizeBytes = sizeBytes;
+    if (catalog_.upsertRemotePhoto(metadata)) {
+      ++cataloged;
+    }
+
+    pendingPhotos_[pendingPhotoCount_].itemId = itemId;
     pendingPhotos_[pendingPhotoCount_].name = name;
-    pendingPhotos_[pendingPhotoCount_].downloadUrl = downloadUrl;
     pendingPhotos_[pendingPhotoCount_].modifiedUtc = modified;
+    pendingPhotos_[pendingPhotoCount_].etag = etag;
+    pendingPhotos_[pendingPhotoCount_].mimeType = mimeType;
+    pendingPhotos_[pendingPhotoCount_].width = width;
+    pendingPhotos_[pendingPhotoCount_].height = height;
+    pendingPhotos_[pendingPhotoCount_].orientation = orientation;
     pendingPhotos_[pendingPhotoCount_].sizeBytes = sizeBytes;
     ++pendingPhotoCount_;
   }
@@ -216,12 +303,21 @@ bool GraphClient::listFolder(const OAuthToken& token) {
     pendingPhotos_[j] = key;
   }
 
+  Serial.print("[Graph] Folder children/files/images: ");
+  Serial.print(totalChildren);
+  Serial.print("/");
+  Serial.print(totalFiles);
+  Serial.print("/");
+  Serial.println(totalImages);
+  Serial.print("[Graph] Cataloged image metadata rows: ");
+  Serial.println(cataloged);
   Serial.print("[Graph] Queued image files: ");
   Serial.println(pendingPhotoCount_);
   return pendingPhotoCount_ > 0;
 }
 
 bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
+  authFailure_ = false;
   if (token.accessToken.isEmpty()) {
     Serial.println("[Graph] Missing access token for download.");
     return false;
@@ -253,10 +349,16 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
       SD.remove(filePath);
     }
 
+    String effectiveUrl;
+    if (!fetchDownloadUrlForItem(photo.itemId, token.accessToken, effectiveUrl)) {
+      Serial.println("[Graph] Could not resolve download URL for item: " + photo.name);
+      continue;
+    }
+
     WiFiClientSecure client;
     client.setInsecure();
     HTTPClient http;
-    if (!http.begin(client, photo.downloadUrl)) {
+    if (!http.begin(client, effectiveUrl)) {
       Serial.println("[Graph] Failed to start download request for: " + photo.name);
       continue;
     }
@@ -265,16 +367,32 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     http.setConnectTimeout(10000);
     http.setReuse(false);
     http.useHTTP10(true);
+    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    http.setRedirectLimit(5);
     http.setUserAgent("OneDriveFrame/0.1");
+    http.addHeader("Connection", "close");
     http.addHeader("Accept", "application/octet-stream");
 
     const int statusCode = http.GET();
     if (statusCode != 200) {
+      const String errorBody = http.getString();
       Serial.print("[Graph] Download failed for ");
       Serial.print(photo.name);
       Serial.print(" with HTTP ");
       Serial.println(statusCode);
+      Serial.print("[Graph] Download URL: ");
+      Serial.println(effectiveUrl);
+      if (!errorBody.isEmpty()) {
+        Serial.println("[Graph] Response body:");
+        Serial.println(errorBody);
+      } else {
+        Serial.println("[Graph] Response body is empty.");
+      }
       http.end();
+      if (statusCode == 401) {
+        authFailure_ = true;
+        return false;
+      }
       continue;
     }
 
@@ -332,6 +450,7 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     Serial.print(" (");
     Serial.print(written);
     Serial.println(" bytes)");
+    catalog_.markDownloaded(photo.itemId, photo.name, filePath, static_cast<uint32_t>(written));
     ++successCount;
   }
 
@@ -343,6 +462,7 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
 }
 
 bool GraphClient::refreshAccessToken(OAuthToken& token) {
+  authFailure_ = false;
   if (!isClientIdConfigured()) {
     Serial.println("[OAuth] Configure CLIENT_ID before attempting token refresh.");
     return false;
@@ -382,6 +502,7 @@ bool GraphClient::refreshAccessToken(OAuthToken& token) {
 }
 
 bool GraphClient::authenticateWithDeviceCode(OAuthToken& token) {
+  authFailure_ = false;
   if (!isClientIdConfigured()) {
     Serial.println("[OAuth] Configure CLIENT_ID before starting device-code login.");
     return false;
@@ -481,6 +602,12 @@ bool GraphClient::authenticateWithDeviceCode(OAuthToken& token) {
 
   Serial.println("[OAuth] Device-code flow timed out before authorization completed.");
   return false;
+}
+
+bool GraphClient::consumeAuthFailure() {
+  const bool value = authFailure_;
+  authFailure_ = false;
+  return value;
 }
 
 }  // namespace odf

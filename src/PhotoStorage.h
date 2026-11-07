@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 
+#include "PhotoCatalog.h"
+
 namespace odf {
 
 class PhotoStorage {
@@ -13,6 +15,7 @@ class PhotoStorage {
 
  private:
   bool isMounted_ = false;
+  PhotoCatalog catalog_;
 };
 
 }  // namespace odf

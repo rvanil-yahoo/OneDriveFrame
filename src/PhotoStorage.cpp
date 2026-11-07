@@ -87,6 +87,15 @@ bool PhotoStorage::begin() {
     }
   }
 
+  if (!catalog_.begin()) {
+    Serial.println("[Storage] Failed to initialize photo catalog.");
+    return false;
+  }
+  if (!catalog_.reconcileWithStorage()) {
+    Serial.println("[Storage] Failed to reconcile photo catalog.");
+    return false;
+  }
+
   isMounted_ = true;
   Serial.println("[Storage] SD card mounted and photo directory ready.");
   return true;

@@ -13,8 +13,8 @@ void TokenStore::end() {
 bool TokenStore::load(OAuthToken& token) const {
   token.accessToken = preferences_.getString("access_token", "");
   token.refreshToken = preferences_.getString("refresh_token", "");
-  token.expiresAtMs = static_cast<uint32_t>(preferences_.getULong("expires_at_ms", 0));
-  return !token.accessToken.isEmpty();
+  token.expiresAtMs = 0;
+  return !token.refreshToken.isEmpty() || !token.accessToken.isEmpty();
 }
 
 void TokenStore::save(const OAuthToken& token) {

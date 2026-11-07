@@ -73,25 +73,38 @@ void OneDriveFrameApp::loop() {
 
     case AppState::kListOneDriveFolder:
       logStateTransition("LIST_ONEDRIVE_FOLDER");
+      if (!photoStorage_.begin()) {
+        Serial.println("[Storage] SD card unavailable; skipping cloud sync.");
+        state_ = AppState::kDisplaySlideshow;
+        break;
+      }
       if (graphClient_.listFolder(token_)) {
         state_ = AppState::kDownloadNewPhotos;
       } else {
-        state_ = AppState::kDisplaySlideshow;
+        if (graphClient_.consumeAuthFailure()) {
+          Serial.println("[OAuth] Graph returned 401. Forcing refresh/login.");
+          token_.accessToken = "";
+          token_.expiresAtMs = 0;
+          state_ = AppState::kRefreshOrLogin;
+        } else {
+          state_ = AppState::kDisplaySlideshow;
+        }
       }
       break;
 
     case AppState::kDownloadNewPhotos:
       logStateTransition("DOWNLOAD_NEW_PHOTOS");
-      if (!photoStorage_.begin()) {
-        Serial.println("[Storage] SD card unavailable; skipping photo sync.");
-        state_ = AppState::kDisplaySlideshow;
-        break;
-      }
-
       if (graphClient_.downloadNewestPhotos(token_)) {
         state_ = AppState::kPruneOldPhotos;
       } else {
-        state_ = AppState::kDisplaySlideshow;
+        if (graphClient_.consumeAuthFailure()) {
+          Serial.println("[OAuth] Download returned 401. Forcing refresh/login.");
+          token_.accessToken = "";
+          token_.expiresAtMs = 0;
+          state_ = AppState::kRefreshOrLogin;
+        } else {
+          state_ = AppState::kDisplaySlideshow;
+        }
       }
       break;
 
