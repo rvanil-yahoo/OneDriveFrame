@@ -25,6 +25,8 @@ constexpr uint32_t kWifiPortalTimeoutMs = 300000UL;
 
 constexpr uint32_t kSyncIntervalMs = 3UL * 60UL * 60UL * 1000UL;
 constexpr uint32_t kSlideDurationMs = 8UL * 1000UL;
+constexpr uint8_t kDisplayRotation = 1;
+constexpr bool kEnableDisplayOutput = true;
 constexpr uint32_t kMaxLocalUsageBytes = 4UL * 1024UL * 1024UL * 1024UL;
 constexpr uint32_t kDefaultDeviceCodePollMs = 5000UL;
 

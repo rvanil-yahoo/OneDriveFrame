@@ -79,7 +79,8 @@ void OneDriveFrameApp::loop() {
         break;
       }
       if (graphClient_.listFolder(token_)) {
-        state_ = AppState::kDownloadNewPhotos;
+        Serial.println("[Graph] Downloads are temporarily disabled; skipping DOWNLOAD_NEW_PHOTOS.");
+        state_ = AppState::kDisplaySlideshow;
       } else {
         if (graphClient_.consumeAuthFailure()) {
           Serial.println("[OAuth] Graph returned 401. Forcing refresh/login.");
@@ -94,18 +95,8 @@ void OneDriveFrameApp::loop() {
 
     case AppState::kDownloadNewPhotos:
       logStateTransition("DOWNLOAD_NEW_PHOTOS");
-      if (graphClient_.downloadNewestPhotos(token_)) {
-        state_ = AppState::kPruneOldPhotos;
-      } else {
-        if (graphClient_.consumeAuthFailure()) {
-          Serial.println("[OAuth] Download returned 401. Forcing refresh/login.");
-          token_.accessToken = "";
-          token_.expiresAtMs = 0;
-          state_ = AppState::kRefreshOrLogin;
-        } else {
-          state_ = AppState::kDisplaySlideshow;
-        }
-      }
+      Serial.println("[Graph] Downloads are temporarily disabled.");
+      state_ = AppState::kDisplaySlideshow;
       break;
 
     case AppState::kPruneOldPhotos:
@@ -123,6 +114,7 @@ void OneDriveFrameApp::loop() {
 
     case AppState::kIdleWaitForSync:
       logStateTransition("IDLE_WAIT_FOR_SYNC");
+      photoStorage_.displaySlideshow();
       delay(1000);
       if (millis() - lastSuccessfulSyncMs_ >= kSyncIntervalMs) {
         state_ = AppState::kWifiConnect;

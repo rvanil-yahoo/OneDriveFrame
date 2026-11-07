@@ -339,6 +339,46 @@ bool PhotoCatalog::upsertRemotePhoto(const RemotePhotoMetadata& metadata) {
   }
 
   if (sqlite3_changes(db) == 0) {
+    const char* adoptSql =
+        "UPDATE photos SET item_id=?, filename=?, size_bytes=?, width=?, height=?, orientation=?, "
+        "last_modified_utc=?, etag=?, mime_type=?, remote_present=1 WHERE local_path=?;";
+    sqlite3_stmt* adoptStmt = nullptr;
+    rc = sqlite3_prepare_v2(db, adoptSql, -1, &adoptStmt, nullptr);
+    if (rc != SQLITE_OK) {
+      logSqliteError("prepare remote metadata adopt", db, rc);
+      sqlite3_close(db);
+      return false;
+    }
+
+    bindNullableText(adoptStmt, 1, metadata.itemId);
+    bindNullableText(adoptStmt, 2, metadata.filename);
+    sqlite3_bind_int64(adoptStmt, 3, static_cast<int64_t>(metadata.sizeBytes));
+    if (metadata.width >= 0) {
+      sqlite3_bind_int(adoptStmt, 4, metadata.width);
+    } else {
+      sqlite3_bind_null(adoptStmt, 4);
+    }
+    if (metadata.height >= 0) {
+      sqlite3_bind_int(adoptStmt, 5, metadata.height);
+    } else {
+      sqlite3_bind_null(adoptStmt, 5);
+    }
+    bindNullableText(adoptStmt, 6, metadata.orientation);
+    bindNullableText(adoptStmt, 7, metadata.modifiedUtc);
+    bindNullableText(adoptStmt, 8, metadata.etag);
+    bindNullableText(adoptStmt, 9, metadata.mimeType);
+    bindNullableText(adoptStmt, 10, metadata.localPath);
+
+    rc = sqlite3_step(adoptStmt);
+    sqlite3_finalize(adoptStmt);
+    if (rc != SQLITE_DONE) {
+      logSqliteError("adopt local row for remote metadata", db, rc);
+      sqlite3_close(db);
+      return false;
+    }
+  }
+
+  if (sqlite3_changes(db) == 0) {
     const char* insertSql =
         "INSERT INTO photos(item_id, filename, local_path, size_bytes, width, height, orientation, "
         "last_modified_utc, etag, mime_type, remote_present, local_present) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0);";
@@ -399,7 +439,7 @@ bool PhotoCatalog::markDownloaded(const String& itemId, const String& filename, 
   }
 
   const char* sql =
-      "UPDATE photos SET local_present=1, filename=?, local_path=?, size_bytes=?, downloaded_utc=datetime('now') "
+      "UPDATE photos SET local_present=1, remote_present=1, filename=?, local_path=?, size_bytes=?, downloaded_utc=datetime('now') "
       "WHERE item_id=?;";
   sqlite3_stmt* updateStmt = nullptr;
   rc = sqlite3_prepare_v2(db, sql, -1, &updateStmt, nullptr);
@@ -422,9 +462,30 @@ bool PhotoCatalog::markDownloaded(const String& itemId, const String& filename, 
   }
 
   if (sqlite3_changes(db) == 0) {
+    const char* adoptSql =
+        "UPDATE photos SET item_id=?, filename=?, size_bytes=?, local_present=1, remote_present=1, "
+        "downloaded_utc=datetime('now') WHERE local_path=?;";
+    sqlite3_stmt* adoptStmt = nullptr;
+    rc = sqlite3_prepare_v2(db, adoptSql, -1, &adoptStmt, nullptr);
+    if (rc == SQLITE_OK) {
+      bindNullableText(adoptStmt, 1, itemId);
+      bindNullableText(adoptStmt, 2, filename);
+      sqlite3_bind_int64(adoptStmt, 3, static_cast<int64_t>(sizeBytes));
+      bindNullableText(adoptStmt, 4, localPath);
+      rc = sqlite3_step(adoptStmt);
+      sqlite3_finalize(adoptStmt);
+    }
+    if (rc != SQLITE_DONE) {
+      sqlite3_close(db);
+      Serial.println("[Catalog] Failed adopting local row while marking download.");
+      return false;
+    }
+  }
+
+  if (sqlite3_changes(db) == 0) {
     const char* insertSql =
-        "INSERT INTO photos(item_id, filename, local_path, size_bytes, local_present, downloaded_utc) "
-        "VALUES(?, ?, ?, ?, 1, datetime('now'));";
+        "INSERT INTO photos(item_id, filename, local_path, size_bytes, local_present, remote_present, downloaded_utc) "
+        "VALUES(?, ?, ?, ?, 1, 1, datetime('now'));";
     sqlite3_stmt* insertStmt = nullptr;
     rc = sqlite3_prepare_v2(db, insertSql, -1, &insertStmt, nullptr);
     if (rc == SQLITE_OK) {

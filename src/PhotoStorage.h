@@ -14,7 +14,16 @@ class PhotoStorage {
   void displaySlideshow();
 
  private:
+  bool refreshPhotoList();
+  bool showPhoto(const String& path);
+
+  static constexpr size_t kMaxPhotoFiles = 256;
   bool isMounted_ = false;
+  bool displayInitialized_ = false;
+  size_t photoFileCount_ = 0;
+  size_t slideshowIndex_ = 0;
+  uint32_t lastSlideAtMs_ = 0;
+  String photoFiles_[kMaxPhotoFiles];
   PhotoCatalog catalog_;
 };
 

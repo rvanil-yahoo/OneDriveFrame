@@ -333,6 +333,8 @@ bool GraphClient::listFolder(const OAuthToken& token) {
     metadata.sizeBytes = sizeBytes;
     if (catalog_.upsertRemotePhoto(metadata)) {
       ++cataloged;
+    } else {
+      Serial.println("[Graph] Catalog upsert failed for: " + name);
     }
 
     pendingPhotos_[pendingPhotoCount_].itemId = itemId;
@@ -504,7 +506,9 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     Serial.print(" (");
     Serial.print(written);
     Serial.println(" bytes)");
-    catalog_.markDownloaded(photo.itemId, photo.name, filePath, static_cast<uint32_t>(written));
+    if (!catalog_.markDownloaded(photo.itemId, photo.name, filePath, static_cast<uint32_t>(written))) {
+      Serial.println("[Graph] Failed to mark download in catalog: " + photo.name);
+    }
     ++successCount;
   }
 
