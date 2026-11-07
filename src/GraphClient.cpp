@@ -152,6 +152,24 @@ bool getWithBearer(const String& url, const String& token, int& statusCode, Stri
   return true;
 }
 
+void logPayloadPreview(const String& label, const String& payload) {
+  Serial.print(label);
+  Serial.print(" length=");
+  Serial.println(payload.length());
+
+  const size_t headLen = payload.length() > 400 ? 400 : payload.length();
+  const size_t tailLen = payload.length() > 200 ? 200 : payload.length();
+
+  if (headLen > 0) {
+    Serial.println("[Graph] Payload head:");
+    Serial.println(payload.substring(0, headLen));
+  }
+  if (payload.length() > tailLen) {
+    Serial.println("[Graph] Payload tail:");
+    Serial.println(payload.substring(payload.length() - tailLen));
+  }
+}
+
 bool fetchDownloadUrlForItem(const String& itemId, const String& accessToken, String& downloadUrl) {
   const String endpoint =
       String(kGraphBaseUrl) + "/me/drive/items/" + urlEncode(itemId) + "?select=id,name,@microsoft.graph.downloadUrl";
@@ -202,29 +220,61 @@ bool GraphClient::listFolder(const OAuthToken& token) {
 
   Serial.println("[Graph] Listing OneDrive folder: " + String(kOneDriveFolderName));
   String endpoint = String(kGraphBaseUrl) + "/me/drive/root:/" + urlEncode(String(kOneDriveFolderName)) + ":/children";
-  endpoint += "?$top=200";
+  endpoint += "?$top=50&$select=id,name,size,lastModifiedDateTime,eTag,file,image,photo";
 
   int statusCode = 0;
   String responseBody;
   if (!getWithBearer(endpoint, token.accessToken, statusCode, responseBody)) {
+    Serial.println("[Graph] Folder request transport failure.");
     return false;
   }
 
   if (statusCode != 200) {
     Serial.print("[Graph] Folder listing failed with HTTP status ");
     Serial.println(statusCode);
-    Serial.println(responseBody);
+    logPayloadPreview("[Graph] Folder error payload", responseBody);
     if (statusCode == 401) {
       authFailure_ = true;
     }
     return false;
   }
 
+  logPayloadPreview("[Graph] Folder response payload", responseBody);
+
   JsonDocument doc;
   DeserializationError parseErr = deserializeJson(doc, responseBody);
   if (parseErr) {
     Serial.print("[Graph] Failed to parse folder list JSON: ");
     Serial.println(parseErr.c_str());
+    if (parseErr == DeserializationError::IncompleteInput) {
+      Serial.println("[Graph] Response appears truncated. Retrying with a smaller page size.");
+      String retryEndpoint =
+          String(kGraphBaseUrl) + "/me/drive/root:/" + urlEncode(String(kOneDriveFolderName)) + ":/children";
+      retryEndpoint += "?$top=10&$select=id,name,size,lastModifiedDateTime,eTag,file,image,photo";
+
+      int retryStatus = 0;
+      String retryBody;
+      if (getWithBearer(retryEndpoint, token.accessToken, retryStatus, retryBody) && retryStatus == 200) {
+        logPayloadPreview("[Graph] Retry payload", retryBody);
+        parseErr = deserializeJson(doc, retryBody);
+        if (!parseErr) {
+          responseBody = retryBody;
+          endpoint = retryEndpoint;
+        } else {
+          Serial.print("[Graph] Retry parse failed: ");
+          Serial.println(parseErr.c_str());
+        }
+      } else {
+        Serial.print("[Graph] Retry request failed with HTTP ");
+        Serial.println(retryStatus);
+      }
+    }
+  }
+
+  if (parseErr) {
+    Serial.print("[Graph] Endpoint: ");
+    Serial.println(endpoint);
+    logPayloadPreview("[Graph] Unparsed payload", responseBody);
     return false;
   }
 

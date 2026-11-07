@@ -26,9 +26,11 @@ const char* cardTypeName(uint8_t type) {
 
 bool PhotoStorage::begin() {
   if (isMounted_) {
+    Serial.println("[Storage] SD already mounted.");
     return true;
   }
 
+  Serial.println("[Storage] Initializing SD SPI bus...");
   pinMode(kSdChipSelectPin, OUTPUT);
   digitalWrite(kSdChipSelectPin, HIGH);
   pinMode(kRtpChipSelectPin, OUTPUT);
@@ -81,16 +83,21 @@ bool PhotoStorage::begin() {
   Serial.println(SD.cardSize() / (1024UL * 1024UL));
 
   if (!SD.exists(kPhotoDirectory)) {
+    Serial.print("[Storage] Creating photo directory: ");
+    Serial.println(kPhotoDirectory);
     if (!SD.mkdir(kPhotoDirectory)) {
       Serial.println("[Storage] Failed to create photo directory.");
       return false;
     }
   }
 
+  Serial.println("[Storage] Initializing SQLite photo catalog...");
   if (!catalog_.begin()) {
     Serial.println("[Storage] Failed to initialize photo catalog.");
+    Serial.println("[Storage] Verify /sd/photos path is writable and catalog.db can be created.");
     return false;
   }
+  Serial.println("[Storage] Reconciling catalog with current SD files...");
   if (!catalog_.reconcileWithStorage()) {
     Serial.println("[Storage] Failed to reconcile photo catalog.");
     return false;

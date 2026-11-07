@@ -12,7 +12,7 @@ namespace odf {
 
 namespace {
 
-constexpr const char* kCatalogPath = "/sd/photos/catalog.db";
+constexpr const char* kCatalogPath = "/sd/catalog.db";
 
 bool bindNullableText(sqlite3_stmt* stmt, int index, const String& value) {
   if (value.isEmpty()) {
@@ -58,6 +58,8 @@ void logSqliteError(const char* context, sqlite3* db, int rc) {
 }  // namespace
 
 bool PhotoCatalog::openDatabase() {
+  Serial.print("[Catalog] Opening DB: ");
+  Serial.println(kCatalogPath);
   sqlite3* db = nullptr;
   const int rc = sqlite3_open(kCatalogPath, &db);
   if (rc != SQLITE_OK) {
@@ -103,6 +105,7 @@ bool PhotoCatalog::execute(const char* sql) {
 }
 
 bool PhotoCatalog::createSchema() {
+  Serial.println("[Catalog] Creating/verifying schema...");
   static constexpr const char* kSchemaSql =
       "CREATE TABLE IF NOT EXISTS photos ("
       "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -125,12 +128,14 @@ bool PhotoCatalog::createSchema() {
       "CREATE INDEX IF NOT EXISTS idx_photos_local_present ON photos(local_present);"
       "CREATE INDEX IF NOT EXISTS idx_photos_size ON photos(size_bytes);";
   if (!execute(kSchemaSql)) {
+    Serial.println("[Catalog] Base schema creation failed.");
     return false;
   }
 
   sqlite3* db = nullptr;
   int rc = sqlite3_open(kCatalogPath, &db);
   if (rc != SQLITE_OK) {
+    logSqliteError("open for schema migration", db, rc);
     if (db != nullptr) {
       sqlite3_close(db);
     }
@@ -138,15 +143,26 @@ bool PhotoCatalog::createSchema() {
   }
 
   if (!hasColumn(db, "photos", "remote_present")) {
+    Serial.println("[Catalog] Applying schema migration: add remote_present.");
     char* errorMessage = nullptr;
     rc = sqlite3_exec(db, "ALTER TABLE photos ADD COLUMN remote_present INTEGER NOT NULL DEFAULT 0;", nullptr, nullptr,
                       &errorMessage);
     if (rc != SQLITE_OK) {
+      bool duplicateColumn = false;
+      if (errorMessage != nullptr && strstr(errorMessage, "duplicate column name") != nullptr) {
+        duplicateColumn = true;
+      }
+      if (!duplicateColumn) {
+        logSqliteError("alter table add remote_present", db, rc);
+        if (errorMessage != nullptr) {
+          sqlite3_free(errorMessage);
+        }
+        sqlite3_close(db);
+        return false;
+      }
       if (errorMessage != nullptr) {
         sqlite3_free(errorMessage);
       }
-      sqlite3_close(db);
-      return false;
     }
   }
 
@@ -159,11 +175,14 @@ bool PhotoCatalog::begin() {
     return true;
   }
 
+  Serial.println("[Catalog] begin() start");
   if (!openDatabase()) {
+    Serial.println("[Catalog] begin() failed in openDatabase().");
     return false;
   }
 
   if (!createSchema()) {
+    Serial.println("[Catalog] begin() failed in createSchema().");
     return false;
   }
 
