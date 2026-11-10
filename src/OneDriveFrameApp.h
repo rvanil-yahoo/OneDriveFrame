@@ -1,6 +1,10 @@
 #pragma once
 
 #include <Arduino.h>
+#include <atomic>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
 #include "AppState.h"
 #include "GraphClient.h"
@@ -17,6 +21,12 @@ class OneDriveFrameApp {
   void loop();
 
  private:
+  static void displayTaskCore0(void* parameter);
+  static void syncTaskCore1(void* parameter);
+  void runDisplayStep();
+  void runSyncStep();
+  void runDisplayTask();
+  void runSyncTask();
   void logStateTransition(const char* stateName) const;
   void printBootBanner() const;
 
@@ -28,6 +38,9 @@ class OneDriveFrameApp {
   WifiSetupManager wifiSetupManager_;
   uint32_t lastSuccessfulSyncMs_ = 0;
   bool tokenStoreInitialized_ = false;
+  std::atomic<bool> displayTaskStarted_{false};
+  std::atomic<bool> syncTaskStarted_{false};
+  SemaphoreHandle_t photoStorageMutex_ = nullptr;
 };
 
 }  // namespace odf

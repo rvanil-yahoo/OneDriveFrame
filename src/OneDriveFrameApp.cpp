@@ -8,10 +8,89 @@ void OneDriveFrameApp::setup() {
   Serial.begin(115200);
   delay(1000);
   printBootBanner();
-  Serial.println("[Storage] SD mount deferred until sync phase.");
+  Serial.println("[Boot] Enabling dual-core mode (display on core 0, sync on core 1).");
+
+  photoStorageMutex_ = xSemaphoreCreateMutex();
+  if (photoStorageMutex_ == nullptr) {
+    Serial.println("[Boot] Failed to create photo storage mutex; continuing in single-core fallback mode.");
+    return;
+  }
+
+  xSemaphoreTake(photoStorageMutex_, portMAX_DELAY);
+  const bool storageReady = photoStorage_.begin();
+  xSemaphoreGive(photoStorageMutex_);
+  if (storageReady) {
+    Serial.println("[Boot] Local photo storage is ready; slideshow will start immediately.");
+  } else {
+    Serial.println("[Boot] Local photo storage not ready yet; waiting for SD and then starting slideshow.");
+  }
+
+  TaskHandle_t displayTaskHandle = nullptr;
+  const BaseType_t displayCreated =
+      xTaskCreatePinnedToCore(displayTaskCore0, "display-core0", 16384U, this, 2, &displayTaskHandle, 0);
+  if (displayCreated != pdPASS) {
+    Serial.println("[Boot] Failed to create display task on core 0.");
+  } else {
+    displayTaskStarted_.store(true);
+  }
+
+  TaskHandle_t syncTaskHandle = nullptr;
+  const BaseType_t syncCreated =
+      xTaskCreatePinnedToCore(syncTaskCore1, "sync-core1", 16384U, this, 2, &syncTaskHandle, 1);
+  if (syncCreated != pdPASS) {
+    Serial.println("[Boot] Failed to create sync task on core 1.");
+  } else {
+    syncTaskStarted_.store(true);
+  }
+
+  if (!displayTaskStarted_.load() || !syncTaskStarted_.load()) {
+    Serial.println("[Boot] Task startup incomplete; using single-core fallback in loop().");
+  }
 }
 
 void OneDriveFrameApp::loop() {
+  if (displayTaskStarted_.load() && syncTaskStarted_.load()) {
+    delay(1000);
+    return;
+  }
+
+  runDisplayStep();
+  runSyncStep();
+  delay(250);
+}
+
+void OneDriveFrameApp::displayTaskCore0(void* parameter) {
+  auto* app = static_cast<OneDriveFrameApp*>(parameter);
+  if (app == nullptr) {
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  app->runDisplayTask();
+}
+
+void OneDriveFrameApp::syncTaskCore1(void* parameter) {
+  auto* app = static_cast<OneDriveFrameApp*>(parameter);
+  if (app == nullptr) {
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  app->runSyncTask();
+}
+
+void OneDriveFrameApp::runDisplayStep() {
+  if (photoStorageMutex_ == nullptr) {
+    return;
+  }
+  xSemaphoreTake(photoStorageMutex_, portMAX_DELAY);
+  if (photoStorage_.begin()) {
+    photoStorage_.displaySlideshow();
+  }
+  xSemaphoreGive(photoStorageMutex_);
+}
+
+void OneDriveFrameApp::runSyncStep() {
   switch (state_) {
     case AppState::kStart:
       logStateTransition("START");
@@ -72,15 +151,24 @@ void OneDriveFrameApp::loop() {
       break;
 
     case AppState::kListOneDriveFolder:
+    {
       logStateTransition("LIST_ONEDRIVE_FOLDER");
-      if (!photoStorage_.begin()) {
-        Serial.println("[Storage] SD card unavailable; skipping cloud sync.");
+      if (photoStorageMutex_ == nullptr) {
+        Serial.println("[Storage] Photo storage mutex not initialized.");
+        state_ = AppState::kDisplaySlideshow;
+        break;
+      }
+      xSemaphoreTake(photoStorageMutex_, portMAX_DELAY);
+      const bool storageReady = photoStorage_.begin();
+      xSemaphoreGive(photoStorageMutex_);
+      if (!storageReady) {
+        Serial.println("[Storage] SD card unavailable; switching to local slideshow mode.");
         state_ = AppState::kDisplaySlideshow;
         break;
       }
       if (graphClient_.listFolder(token_)) {
-        Serial.println("[Graph] Downloads are temporarily disabled; skipping DOWNLOAD_NEW_PHOTOS.");
-        state_ = AppState::kDisplaySlideshow;
+        Serial.println("[Graph] Folder list succeeded. Starting download queue for new images.");
+        state_ = AppState::kDownloadNewPhotos;
       } else {
         if (graphClient_.consumeAuthFailure()) {
           Serial.println("[OAuth] Graph returned 401. Forcing refresh/login.");
@@ -92,30 +180,44 @@ void OneDriveFrameApp::loop() {
         }
       }
       break;
+    }
 
     case AppState::kDownloadNewPhotos:
       logStateTransition("DOWNLOAD_NEW_PHOTOS");
-      Serial.println("[Graph] Downloads are temporarily disabled.");
+      Serial.println("[Graph] Starting background photo download pass.");
+      if (graphClient_.downloadNewestPhotos(token_)) {
+        Serial.println("[Graph] Download pass completed successfully.");
+      } else {
+        Serial.println("[Graph] Download pass did not complete successfully.");
+        if (graphClient_.consumeAuthFailure()) {
+          Serial.println("[OAuth] Download returned 401. Forcing refresh/login.");
+          token_.accessToken = "";
+          token_.expiresAtMs = 0;
+          state_ = AppState::kRefreshOrLogin;
+          break;
+        }
+      }
+      lastSuccessfulSyncMs_ = millis();
       state_ = AppState::kDisplaySlideshow;
       break;
 
     case AppState::kPruneOldPhotos:
       logStateTransition("PRUNE_OLD_PHOTOS");
-      photoStorage_.pruneOldestPhotos();
+      if (photoStorageMutex_ != nullptr) {
+        xSemaphoreTake(photoStorageMutex_, portMAX_DELAY);
+        photoStorage_.pruneOldestPhotos();
+        xSemaphoreGive(photoStorageMutex_);
+      }
       lastSuccessfulSyncMs_ = millis();
       state_ = AppState::kDisplaySlideshow;
       break;
 
     case AppState::kDisplaySlideshow:
       logStateTransition("DISPLAY_SLIDESHOW");
-      photoStorage_.displaySlideshow();
       state_ = AppState::kIdleWaitForSync;
       break;
 
     case AppState::kIdleWaitForSync:
-      logStateTransition("IDLE_WAIT_FOR_SYNC");
-      photoStorage_.displaySlideshow();
-      delay(1000);
       if (millis() - lastSuccessfulSyncMs_ >= kSyncIntervalMs) {
         state_ = AppState::kWifiConnect;
       }
@@ -125,8 +227,20 @@ void OneDriveFrameApp::loop() {
       state_ = AppState::kStart;
       break;
   }
+}
 
-  delay(250);
+void OneDriveFrameApp::runDisplayTask() {
+  for (;;) {
+    runDisplayStep();
+    vTaskDelay(pdMS_TO_TICKS(16));
+  }
+}
+
+void OneDriveFrameApp::runSyncTask() {
+  for (;;) {
+    runSyncStep();
+    vTaskDelay(pdMS_TO_TICKS(250));
+  }
 }
 
 void OneDriveFrameApp::logStateTransition(const char* stateName) const {

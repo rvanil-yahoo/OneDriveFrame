@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <SD.h>
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
 
 #include "FrameConfig.h"
@@ -13,6 +14,8 @@ namespace {
 
 constexpr const char* kPlaceholderClientId = "00000000-0000-0000-0000-000000000000";
 constexpr size_t kHttpBufferSize = 2048;
+
+void trimAtFirstNul(String& payload);
 
 String urlEncode(const String& value) {
   String encoded;
@@ -34,33 +37,61 @@ String urlEncode(const String& value) {
 }
 
 bool postForm(const String& url, const String& formBody, int& statusCode, String& responseBody) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(15000);
+  const uint8_t maxRetries = 3U;
 
-  HTTPClient http;
-  if (!http.begin(client, url)) {
-    Serial.println("[OAuth] Failed to initialize HTTPS client.");
-    return false;
-  }
+  for (uint8_t attempt = 0; attempt <= maxRetries; ++attempt) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.print("[OAuth] WiFi not connected before POST attempt ");
+      Serial.print(attempt + 1);
+      Serial.print("/");
+      Serial.println(maxRetries + 1);
+      delay(1000U);
+      if (WiFi.status() != WL_CONNECTED) {
+        return false;
+      }
+    }
 
-  http.setTimeout(15000);
-  http.setConnectTimeout(10000);
-  http.setReuse(false);
-  http.useHTTP10(true);
-  http.addHeader("Connection", "close");
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  statusCode = http.POST(formBody);
-  responseBody = http.getString();
-  http.end();
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(15000);
 
-  if (statusCode <= 0) {
+    HTTPClient http;
+    if (!http.begin(client, url)) {
+      Serial.println("[OAuth] Failed to initialize HTTPS client.");
+      return false;
+    }
+
+    http.setTimeout(15000);
+    http.setConnectTimeout(10000);
+    http.setReuse(false);
+    http.useHTTP10(true);
+    http.addHeader("Connection", "close");
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    statusCode = http.POST(formBody);
+    responseBody = http.getString();
+    trimAtFirstNul(responseBody);
+    http.end();
+
+    if (statusCode > 0) {
+      return true;
+    }
+
     Serial.print("[OAuth] HTTPS request failed: ");
-    Serial.println(statusCode);
+    Serial.print(statusCode);
+    Serial.print(" (attempt ");
+    Serial.print(attempt + 1);
+    Serial.print("/");
+    Serial.print(maxRetries + 1);
+    Serial.println(")");
+
+    if (attempt < maxRetries) {
+      delay(1500UL * (attempt + 1));
+      continue;
+    }
     return false;
   }
 
-  return true;
+  return false;
 }
 
 bool parseTokenResponse(const String& payload, OAuthToken& token) {
@@ -120,36 +151,115 @@ String sanitizeFilename(const String& name) {
   return out;
 }
 
+void trimAtFirstNul(String& payload) {
+  const int nulIndex = payload.indexOf('\0');
+  if (nulIndex >= 0) {
+    payload.remove(static_cast<unsigned int>(nulIndex));
+  }
+}
+
+uint32_t parseRetryAfterSeconds(HTTPClient& http) {
+  String retryAfterHeader = http.header("Retry-After");
+  if (retryAfterHeader.length() == 0) {
+    return 0U;
+  }
+
+  retryAfterHeader.trim();
+  if (retryAfterHeader.length() == 0) {
+    return 0U;
+  }
+
+  const unsigned long seconds = retryAfterHeader.toInt();
+  if (seconds > 0UL) {
+    return seconds * 1000UL;
+  }
+
+  return 0U;
+}
+
 bool getWithBearer(const String& url, const String& token, int& statusCode, String& responseBody) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(15000);
+  const uint32_t kBaseRetryDelayMs = 2000UL;
+  const uint8_t kMaxRetries = 5U;
 
-  HTTPClient http;
-  if (!http.begin(client, url)) {
-    Serial.println("[Graph] Failed to initialize HTTPS client.");
-    return false;
+  for (uint8_t attempt = 0; attempt <= kMaxRetries; ++attempt) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.print("[Graph] WiFi not connected before GET attempt ");
+      Serial.print(attempt + 1);
+      Serial.print("/");
+      Serial.println(kMaxRetries + 1);
+      delay(1000U);
+      if (WiFi.status() != WL_CONNECTED) {
+        statusCode = -5;
+        return false;
+      }
+    }
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(15000);
+
+    HTTPClient http;
+    if (!http.begin(client, url)) {
+      Serial.println("[Graph] Failed to initialize HTTPS client.");
+      return false;
+    }
+
+    http.setTimeout(15000);
+    http.setConnectTimeout(10000);
+    http.setReuse(false);
+    http.useHTTP10(true);
+    http.addHeader("Connection", "close");
+    http.addHeader("Authorization", "Bearer " + token);
+    http.addHeader("Accept", "application/json");
+
+    statusCode = http.GET();
+    responseBody = http.getString();
+    trimAtFirstNul(responseBody);
+    const uint32_t retryAfterMs = parseRetryAfterSeconds(http);
+    http.end();
+
+    if (statusCode <= 0) {
+      Serial.print("[Graph] HTTPS request failed: ");
+      Serial.print(statusCode);
+      Serial.print(" (attempt ");
+      Serial.print(attempt + 1);
+      Serial.print("/");
+      Serial.print(kMaxRetries + 1);
+      Serial.println(")");
+      if (attempt < kMaxRetries) {
+        delay(1500UL * (attempt + 1));
+        continue;
+      }
+      return false;
+    }
+
+    if (statusCode == 429) {
+      if (attempt >= kMaxRetries) {
+        Serial.print("[Graph] Rate limited (429) after ");
+        Serial.print(kMaxRetries + 1);
+        Serial.println(" attempts. Giving up.");
+        return false;
+      }
+
+      uint32_t delayMs = retryAfterMs;
+      if (delayMs == 0U) {
+        delayMs = kBaseRetryDelayMs << std::min<uint8_t>(attempt, 3U);
+      }
+      Serial.print("[Graph] Rate limited (429); retrying after ");
+      Serial.print(delayMs);
+      Serial.print(" ms (attempt ");
+      Serial.print(attempt + 1);
+      Serial.print("/");
+      Serial.print(kMaxRetries + 1);
+      Serial.println(")");
+      delay(delayMs);
+      continue;
+    }
+
+    return true;
   }
 
-  http.setTimeout(15000);
-  http.setConnectTimeout(10000);
-  http.setReuse(false);
-  http.useHTTP10(true);
-  http.addHeader("Connection", "close");
-  http.addHeader("Authorization", "Bearer " + token);
-  http.addHeader("Accept", "application/json");
-
-  statusCode = http.GET();
-  responseBody = http.getString();
-  http.end();
-
-  if (statusCode <= 0) {
-    Serial.print("[Graph] HTTPS request failed: ");
-    Serial.println(statusCode);
-    return false;
-  }
-
-  return true;
+  return false;
 }
 
 void logPayloadPreview(const String& label, const String& payload) {
@@ -220,69 +330,7 @@ bool GraphClient::listFolder(const OAuthToken& token) {
 
   Serial.println("[Graph] Listing OneDrive folder: " + String(kOneDriveFolderName));
   String endpoint = String(kGraphBaseUrl) + "/me/drive/root:/" + urlEncode(String(kOneDriveFolderName)) + ":/children";
-  endpoint += "?$top=50&$select=id,name,size,lastModifiedDateTime,eTag,file,image,photo";
-
-  int statusCode = 0;
-  String responseBody;
-  if (!getWithBearer(endpoint, token.accessToken, statusCode, responseBody)) {
-    Serial.println("[Graph] Folder request transport failure.");
-    return false;
-  }
-
-  if (statusCode != 200) {
-    Serial.print("[Graph] Folder listing failed with HTTP status ");
-    Serial.println(statusCode);
-    logPayloadPreview("[Graph] Folder error payload", responseBody);
-    if (statusCode == 401) {
-      authFailure_ = true;
-    }
-    return false;
-  }
-
-  logPayloadPreview("[Graph] Folder response payload", responseBody);
-
-  JsonDocument doc;
-  DeserializationError parseErr = deserializeJson(doc, responseBody);
-  if (parseErr) {
-    Serial.print("[Graph] Failed to parse folder list JSON: ");
-    Serial.println(parseErr.c_str());
-    if (parseErr == DeserializationError::IncompleteInput) {
-      Serial.println("[Graph] Response appears truncated. Retrying with a smaller page size.");
-      String retryEndpoint =
-          String(kGraphBaseUrl) + "/me/drive/root:/" + urlEncode(String(kOneDriveFolderName)) + ":/children";
-      retryEndpoint += "?$top=10&$select=id,name,size,lastModifiedDateTime,eTag,file,image,photo";
-
-      int retryStatus = 0;
-      String retryBody;
-      if (getWithBearer(retryEndpoint, token.accessToken, retryStatus, retryBody) && retryStatus == 200) {
-        logPayloadPreview("[Graph] Retry payload", retryBody);
-        parseErr = deserializeJson(doc, retryBody);
-        if (!parseErr) {
-          responseBody = retryBody;
-          endpoint = retryEndpoint;
-        } else {
-          Serial.print("[Graph] Retry parse failed: ");
-          Serial.println(parseErr.c_str());
-        }
-      } else {
-        Serial.print("[Graph] Retry request failed with HTTP ");
-        Serial.println(retryStatus);
-      }
-    }
-  }
-
-  if (parseErr) {
-    Serial.print("[Graph] Endpoint: ");
-    Serial.println(endpoint);
-    logPayloadPreview("[Graph] Unparsed payload", responseBody);
-    return false;
-  }
-
-  JsonArray items = doc["value"].as<JsonArray>();
-  if (items.isNull()) {
-    Serial.println("[Graph] Folder list missing 'value' array.");
-    return false;
-  }
+  endpoint += "?$top=25&$select=id,name,size,lastModifiedDateTime,eTag,file,image,photo";
   if (!catalog_.beginRemoteSync()) {
     Serial.println("[Graph] Failed to reset remote catalog presence flags.");
     return false;
@@ -292,61 +340,103 @@ bool GraphClient::listFolder(const OAuthToken& token) {
   size_t totalFiles = 0;
   size_t totalImages = 0;
   size_t cataloged = 0;
+  bool queueLimitReached = false;
 
-  for (JsonVariant item : items) {
-    ++totalChildren;
-    const bool isFile = !item["file"].isNull();
-    const String name = item["name"] | "";
-    const String itemId = item["id"] | "";
-    const String modified = item["lastModifiedDateTime"] | "";
-    const uint32_t sizeBytes = item["size"] | 0U;
-    const String etag = item["eTag"] | "";
-    const String mimeType = item["file"]["mimeType"] | "";
-    const int32_t width = item["image"]["width"] | -1;
-    const int32_t height = item["image"]["height"] | -1;
-    const String orientation = item["photo"]["orientation"] | "";
-    if (isFile) {
-      ++totalFiles;
+  while (!endpoint.isEmpty()) {
+    int statusCode = 0;
+    String responseBody;
+    if (!getWithBearer(endpoint, token.accessToken, statusCode, responseBody)) {
+      Serial.println("[Graph] Folder request transport failure.");
+      return false;
     }
 
-    if (!isFile || !isAllowedImage(name) || modified.isEmpty() || itemId.isEmpty()) {
-      continue;
+    if (statusCode != 200) {
+      Serial.print("[Graph] Folder listing failed with HTTP status ");
+      Serial.println(statusCode);
+      logPayloadPreview("[Graph] Folder error payload", responseBody);
+      if (statusCode == 401) {
+        authFailure_ = true;
+      }
+      return false;
     }
 
-    ++totalImages;
+    logPayloadPreview("[Graph] Folder response payload", responseBody);
 
-    if (pendingPhotoCount_ >= (sizeof(pendingPhotos_) / sizeof(pendingPhotos_[0]))) {
-      continue;
+    JsonDocument doc;
+    DeserializationError parseErr = deserializeJson(doc, responseBody);
+    if (parseErr) {
+      Serial.print("[Graph] Failed to parse folder list JSON: ");
+      Serial.println(parseErr.c_str());
+      Serial.print("[Graph] Endpoint: ");
+      Serial.println(endpoint);
+      logPayloadPreview("[Graph] Unparsed payload", responseBody);
+      return false;
     }
 
-    const String localPath = String(kPhotoDirectory) + "/" + sanitizeFilename(name);
-    PhotoCatalog::RemotePhotoMetadata metadata;
-    metadata.itemId = itemId;
-    metadata.filename = name;
-    metadata.localPath = localPath;
-    metadata.modifiedUtc = modified;
-    metadata.etag = etag;
-    metadata.mimeType = mimeType;
-    metadata.width = width;
-    metadata.height = height;
-    metadata.orientation = orientation;
-    metadata.sizeBytes = sizeBytes;
-    if (catalog_.upsertRemotePhoto(metadata)) {
-      ++cataloged;
-    } else {
-      Serial.println("[Graph] Catalog upsert failed for: " + name);
+    JsonArray items = doc["value"].as<JsonArray>();
+    if (items.isNull()) {
+      Serial.println("[Graph] Folder list missing 'value' array.");
+      return false;
     }
 
-    pendingPhotos_[pendingPhotoCount_].itemId = itemId;
-    pendingPhotos_[pendingPhotoCount_].name = name;
-    pendingPhotos_[pendingPhotoCount_].modifiedUtc = modified;
-    pendingPhotos_[pendingPhotoCount_].etag = etag;
-    pendingPhotos_[pendingPhotoCount_].mimeType = mimeType;
-    pendingPhotos_[pendingPhotoCount_].width = width;
-    pendingPhotos_[pendingPhotoCount_].height = height;
-    pendingPhotos_[pendingPhotoCount_].orientation = orientation;
-    pendingPhotos_[pendingPhotoCount_].sizeBytes = sizeBytes;
-    ++pendingPhotoCount_;
+    for (JsonVariant item : items) {
+      ++totalChildren;
+      const bool isFile = !item["file"].isNull();
+      const String name = item["name"] | "";
+      const String itemId = item["id"] | "";
+      const String modified = item["lastModifiedDateTime"] | "";
+      const uint32_t sizeBytes = item["size"] | 0U;
+      const String etag = item["eTag"] | "";
+      const String mimeType = item["file"]["mimeType"] | "";
+      const int32_t width = item["image"]["width"] | -1;
+      const int32_t height = item["image"]["height"] | -1;
+      const String orientation = item["photo"]["orientation"] | "";
+      if (isFile) {
+        ++totalFiles;
+      }
+
+      if (!isFile || !isAllowedImage(name) || modified.isEmpty() || itemId.isEmpty()) {
+        continue;
+      }
+
+      ++totalImages;
+
+      const String localPath = String(kPhotoDirectory) + "/" + sanitizeFilename(name);
+      PhotoCatalog::RemotePhotoMetadata metadata;
+      metadata.itemId = itemId;
+      metadata.filename = name;
+      metadata.localPath = localPath;
+      metadata.modifiedUtc = modified;
+      metadata.etag = etag;
+      metadata.mimeType = mimeType;
+      metadata.width = width;
+      metadata.height = height;
+      metadata.orientation = orientation;
+      metadata.sizeBytes = sizeBytes;
+      if (catalog_.upsertRemotePhoto(metadata)) {
+        ++cataloged;
+      } else {
+        Serial.println("[Graph] Catalog upsert failed for: " + name);
+      }
+
+      if (pendingPhotoCount_ >= (sizeof(pendingPhotos_) / sizeof(pendingPhotos_[0]))) {
+        queueLimitReached = true;
+        continue;
+      }
+
+      pendingPhotos_[pendingPhotoCount_].itemId = itemId;
+      pendingPhotos_[pendingPhotoCount_].name = name;
+      pendingPhotos_[pendingPhotoCount_].modifiedUtc = modified;
+      pendingPhotos_[pendingPhotoCount_].etag = etag;
+      pendingPhotos_[pendingPhotoCount_].mimeType = mimeType;
+      pendingPhotos_[pendingPhotoCount_].width = width;
+      pendingPhotos_[pendingPhotoCount_].height = height;
+      pendingPhotos_[pendingPhotoCount_].orientation = orientation;
+      pendingPhotos_[pendingPhotoCount_].sizeBytes = sizeBytes;
+      ++pendingPhotoCount_;
+    }
+
+    endpoint = doc["@odata.nextLink"] | "";
   }
 
   for (size_t i = 1; i < pendingPhotoCount_; ++i) {
@@ -369,6 +459,11 @@ bool GraphClient::listFolder(const OAuthToken& token) {
   Serial.println(cataloged);
   Serial.print("[Graph] Queued image files: ");
   Serial.println(pendingPhotoCount_);
+  if (queueLimitReached) {
+    Serial.print("[Graph] Queue limit reached; only the first ");
+    Serial.print(sizeof(pendingPhotos_) / sizeof(pendingPhotos_[0]));
+    Serial.println(" images will be downloaded this sync pass.");
+  }
   return pendingPhotoCount_ > 0;
 }
 
@@ -384,12 +479,22 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     return true;
   }
 
-  Serial.println("[Graph] Downloading newest photos that fit within the quota.");
+  Serial.println("[Graph] Downloading queued OneDrive folder photos.");
+  Serial.print("[Graph] Download queue size: ");
+  Serial.println(pendingPhotoCount_);
 
   size_t successCount = 0;
   for (size_t i = 0; i < pendingPhotoCount_; ++i) {
     const PendingPhoto& photo = pendingPhotos_[i];
     const String filePath = String(kPhotoDirectory) + "/" + sanitizeFilename(photo.name);
+
+    Serial.print("[Graph] Preparing to download: ");
+    Serial.print(photo.name);
+    Serial.print(" (id=");
+    Serial.print(photo.itemId);
+    Serial.print(", size=");
+    Serial.print(photo.sizeBytes);
+    Serial.println(" bytes)");
 
     if (SD.exists(filePath)) {
       File existing = SD.open(filePath, FILE_READ);
@@ -410,6 +515,18 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
       Serial.println("[Graph] Could not resolve download URL for item: " + photo.name);
       continue;
     }
+
+    Serial.print("[Graph] Download URL resolved for ");
+    Serial.print(photo.name);
+    Serial.print(" -> ");
+    Serial.println(effectiveUrl.substring(0, 120));
+    Serial.print("[Graph] Source file target: ");
+    Serial.println(filePath);
+    Serial.print("[Graph] Download expected size: ");
+    Serial.print(photo.sizeBytes);
+    Serial.print(" bytes, local path exists before write: ");
+    Serial.println(SD.exists(filePath) ? "yes" : "no");
+
 
     WiFiClientSecure client;
     client.setInsecure();
@@ -509,7 +626,12 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     if (!catalog_.markDownloaded(photo.itemId, photo.name, filePath, static_cast<uint32_t>(written))) {
       Serial.println("[Graph] Failed to mark download in catalog: " + photo.name);
     }
+
     ++successCount;
+    Serial.print("[Graph] Download progress: ");
+    Serial.print(successCount);
+    Serial.print("/");
+    Serial.println(pendingPhotoCount_);
   }
 
   Serial.print("[Graph] Downloaded files this sync: ");
