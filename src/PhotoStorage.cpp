@@ -202,39 +202,37 @@ bool ensureLvglDisplay() {
   return true;
 }
 
-void updateLvglImage(const uint16_t* imagePixels, uint16_t imageW, uint16_t imageH) {
+bool updateLvglImage(const uint16_t* imagePixels, uint16_t imageW, uint16_t imageH) {
   if (!gLvglInitialized && !ensureLvglDisplay()) {
-    return;
+    return false;
   }
 
   if (imagePixels == nullptr || imageW == 0 || imageH == 0) {
-    return;
+    Serial.println("[LVGL] Invalid image buffer or dimensions.");
+    return false;
   }
-
-  imageW  = 800;
-  imageH = 480;
 
   if (gLvImage == nullptr) {
     gLvImage = lv_img_create(lv_scr_act());
     if (gLvImage == nullptr) {
-      return;
+      Serial.println("[LVGL] Failed to create image widget.");
+      return false;
     }
   }
 
   if (gLvImageWidth != imageW || gLvImageHeight != imageH || gLvImageBuffer == nullptr) {
-    if (gLvImageBuffer != nullptr) {
-      heap_caps_free(gLvImageBuffer);
-      gLvImageBuffer = nullptr;
-    }
     const size_t imageBytes = static_cast<size_t>(imageW) * imageH * sizeof(lv_color_t);
-    gLvImageBuffer = static_cast<lv_color_t*>(heap_caps_malloc(imageBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (gLvImageBuffer == nullptr) {
-      gLvImageBuffer = static_cast<lv_color_t*>(malloc(imageBytes));
+    auto* newBuffer = static_cast<lv_color_t*>(heap_caps_malloc(imageBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (newBuffer == nullptr) {
+      newBuffer = static_cast<lv_color_t*>(malloc(imageBytes));
     }
-    if (gLvImageBuffer == nullptr) {
+    if (newBuffer == nullptr) {
       Serial.println("[LVGL] Failed to allocate image buffer.");
-      return;
+      return false;
     }
+    lv_img_cache_invalidate_src(&gLvImageDescriptor);
+    heap_caps_free(gLvImageBuffer);
+    gLvImageBuffer = newBuffer;
     gLvImageWidth = imageW;
     gLvImageHeight = imageH;
   }
@@ -255,11 +253,13 @@ void updateLvglImage(const uint16_t* imagePixels, uint16_t imageW, uint16_t imag
   gLvImageDescriptor.data_size = static_cast<uint32_t>(pixelCount * sizeof(lv_color_t));
   gLvImageDescriptor.data = reinterpret_cast<const uint8_t*>(gLvImageBuffer);
 
+  lv_img_cache_invalidate_src(&gLvImageDescriptor);
   lv_img_set_src(gLvImage, &gLvImageDescriptor);
-  lv_obj_set_pos(gLvImage, 0, 0);
   lv_obj_set_size(gLvImage, imageW, imageH);
+  lv_obj_center(gLvImage);
   lv_obj_invalidate(gLvImage);
   lv_refr_now(nullptr);
+  return true;
 }
 
 void resizeRgb565Nearest(const uint16_t* src, uint16_t srcW, uint16_t srcH, uint16_t dstW, uint16_t dstH, uint16_t* dst) {
@@ -494,6 +494,15 @@ bool PhotoStorage::decodeJpegToRgb565(const String& sourcePath, uint16_t targetW
   }
 
   const uint8_t jpegScale = chooseJpegScale(srcW, srcH, targetW, targetH);
+  if (srcW == 0 || srcH == 0) {
+    Serial.println("[Display] Invalid JPEG dimensions.");
+    return false;
+  }
+  if (static_cast<uint32_t>(srcW) * targetH >= static_cast<uint32_t>(srcH) * targetW) {
+    targetH = static_cast<uint16_t>(std::max<uint32_t>(1U, static_cast<uint32_t>(srcH) * targetW / srcW));
+  } else {
+    targetW = static_cast<uint16_t>(std::max<uint32_t>(1U, static_cast<uint32_t>(srcW) * targetH / srcH));
+  }
   const uint16_t scaledW = scaledDimension(srcW, jpegScale);
   const uint16_t scaledH = scaledDimension(srcH, jpegScale);
 
@@ -508,7 +517,7 @@ bool PhotoStorage::decodeJpegToRgb565(const String& sourcePath, uint16_t targetW
   gDecodedImage.active = true;
 
   TJpgDec.setSwapBytes(false);
-  TJpgDec.setJpgScale(jpegScale);
+  TJpgDec.setJpgScale(static_cast<uint8_t>(1U << jpegScale));
   TJpgDec.setCallback([](int16_t x, int16_t y, uint16_t blockW, uint16_t blockH, uint16_t* bitmap) {
     if (bitmap == nullptr || !gDecodedImage.active || gDecodedImage.pixels == nullptr) {
       return false;
@@ -609,7 +618,9 @@ bool PhotoStorage::showPhoto(const String& path) {
   Serial.print(readyW);
   Serial.print("x");
   Serial.println(readyH);
-  updateLvglImage(readyPixels.get(), readyW, readyH);
+  if (!updateLvglImage(readyPixels.get(), readyW, readyH)) {
+    return false;
+  }
   Serial.println("[Display] Showing decoded image via LVGL image widget: " + path);
   return true;
 }
