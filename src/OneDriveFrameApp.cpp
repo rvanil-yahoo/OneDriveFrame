@@ -16,18 +16,37 @@ void OneDriveFrameApp::setup() {
     return;
   }
 
-  xSemaphoreTake(photoStorageMutex_, portMAX_DELAY);
-  const bool storageReady = photoStorage_.begin();
-  xSemaphoreGive(photoStorageMutex_);
+  Serial.println("[Boot] Waiting for mission-critical storage initialization...");
+  uint32_t nextRetryLogMs = 0;
+  bool storageReady = false;
+  while (!storageReady) {
+    xSemaphoreTake(photoStorageMutex_, portMAX_DELAY);
+    storageReady = photoStorage_.begin();
+    if (storageReady) {
+      photoStorage_.displaySlideshow();
+    }
+    xSemaphoreGive(photoStorageMutex_);
+
+    if (storageReady) {
+      break;
+    }
+
+    const uint32_t now = millis();
+    if (nextRetryLogMs == 0 || now >= nextRetryLogMs) {
+      Serial.println("[Boot] Storage not ready yet; retrying until available.");
+      nextRetryLogMs = now + 5000UL;
+    }
+    delay(500);
+  }
+
+  storageReady_.store(storageReady);
   if (storageReady) {
     Serial.println("[Boot] Local photo storage is ready; slideshow will start immediately.");
-  } else {
-    Serial.println("[Boot] Local photo storage not ready yet; waiting for SD and then starting slideshow.");
   }
 
   TaskHandle_t displayTaskHandle = nullptr;
   const BaseType_t displayCreated =
-      xTaskCreatePinnedToCore(displayTaskCore0, "display-core0", 16384U, this, 2, &displayTaskHandle, 0);
+      xTaskCreatePinnedToCore(displayTaskCore0, "display-core0", 16384U, this, 3, &displayTaskHandle, 0);
   if (displayCreated != pdPASS) {
     Serial.println("[Boot] Failed to create display task on core 0.");
   } else {
@@ -36,7 +55,7 @@ void OneDriveFrameApp::setup() {
 
   TaskHandle_t syncTaskHandle = nullptr;
   const BaseType_t syncCreated =
-      xTaskCreatePinnedToCore(syncTaskCore1, "sync-core1", 16384U, this, 2, &syncTaskHandle, 1);
+      xTaskCreatePinnedToCore(syncTaskCore1, "sync-core1", 16384U, this, 1, &syncTaskHandle, 1);
   if (syncCreated != pdPASS) {
     Serial.println("[Boot] Failed to create sync task on core 1.");
   } else {
@@ -83,10 +102,25 @@ void OneDriveFrameApp::runDisplayStep() {
   if (photoStorageMutex_ == nullptr) {
     return;
   }
-  xSemaphoreTake(photoStorageMutex_, portMAX_DELAY);
-  if (photoStorage_.begin()) {
-    photoStorage_.displaySlideshow();
+
+  if (!storageReady_.load()) {
+    const uint32_t now = millis();
+    if (lastStorageRetryMs_ == 0 || now - lastStorageRetryMs_ >= 5000UL) {
+      lastStorageRetryMs_ = now;
+      xSemaphoreTake(photoStorageMutex_, portMAX_DELAY);
+      const bool storageReady = photoStorage_.begin();
+      xSemaphoreGive(photoStorageMutex_);
+      storageReady_.store(storageReady);
+      if (!storageReady) {
+        return;
+      }
+    } else {
+      return;
+    }
   }
+
+  xSemaphoreTake(photoStorageMutex_, portMAX_DELAY);
+  photoStorage_.displaySlideshow();
   xSemaphoreGive(photoStorageMutex_);
 }
 
@@ -158,9 +192,13 @@ void OneDriveFrameApp::runSyncStep() {
         state_ = AppState::kDisplaySlideshow;
         break;
       }
-      xSemaphoreTake(photoStorageMutex_, portMAX_DELAY);
-      const bool storageReady = photoStorage_.begin();
-      xSemaphoreGive(photoStorageMutex_);
+      bool storageReady = storageReady_.load();
+      if (!storageReady) {
+        xSemaphoreTake(photoStorageMutex_, portMAX_DELAY);
+        storageReady = photoStorage_.begin();
+        xSemaphoreGive(photoStorageMutex_);
+        storageReady_.store(storageReady);
+      }
       if (!storageReady) {
         Serial.println("[Storage] SD card unavailable; switching to local slideshow mode.");
         state_ = AppState::kDisplaySlideshow;

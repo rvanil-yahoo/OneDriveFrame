@@ -487,6 +487,7 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
   for (size_t i = 0; i < pendingPhotoCount_; ++i) {
     const PendingPhoto& photo = pendingPhotos_[i];
     const String filePath = String(kPhotoDirectory) + "/" + sanitizeFilename(photo.name);
+    const String tempFilePath = filePath + ".part";
 
     Serial.print("[Graph] Preparing to download: ");
     Serial.print(photo.name);
@@ -508,6 +509,9 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
         existing.close();
       }
       SD.remove(filePath);
+    }
+    if (SD.exists(tempFilePath)) {
+      SD.remove(tempFilePath);
     }
 
     String effectiveUrl;
@@ -569,9 +573,9 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
       continue;
     }
 
-    File outFile = SD.open(filePath, FILE_WRITE);
+    File outFile = SD.open(tempFilePath, FILE_WRITE);
     if (!outFile) {
-      Serial.println("[Graph] Failed to open SD file for write: " + filePath);
+      Serial.println("[Graph] Failed to open SD temp file for write: " + tempFilePath);
       http.end();
       continue;
     }
@@ -614,7 +618,18 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
       Serial.print(photo.sizeBytes);
       Serial.print(" written=");
       Serial.println(written);
-      SD.remove(filePath);
+      SD.remove(tempFilePath);
+      continue;
+    }
+
+    if (SD.exists(filePath) && !SD.remove(filePath)) {
+      Serial.println("[Graph] Failed to replace existing file: " + filePath);
+      SD.remove(tempFilePath);
+      continue;
+    }
+    if (!SD.rename(tempFilePath, filePath)) {
+      Serial.println("[Graph] Failed to rename temp file into place: " + photo.name);
+      SD.remove(tempFilePath);
       continue;
     }
 

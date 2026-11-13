@@ -37,7 +37,9 @@ class OneDriveFrameApp {
   PhotoStorage photoStorage_;
   WifiSetupManager wifiSetupManager_;
   uint32_t lastSuccessfulSyncMs_ = 0;
+  uint32_t lastStorageRetryMs_ = 0;
   bool tokenStoreInitialized_ = false;
+  std::atomic<bool> storageReady_{false};
   std::atomic<bool> displayTaskStarted_{false};
   std::atomic<bool> syncTaskStarted_{false};
   SemaphoreHandle_t photoStorageMutex_ = nullptr;
