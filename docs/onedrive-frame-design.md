@@ -66,15 +66,18 @@ This is the sign-in authority for Microsoft personal accounts (MSA). The app is 
 - dedicated photo folder
 
 ### 4.3 Data flow
-1. Start up and connect to Wi‑Fi.
-2. Load stored refresh token and expiry from NVS.
-3. If token is expired, refresh it. If refresh fails, begin device-code login.
-4. Call OneDrive Graph to list the folder contents.
-5. Sort files by last modified time descending.
-6. Download newest files until the configured storage quota is reached.
-7. Delete oldest local files when quota is exceeded.
-8. Display images from the SD card in slideshow mode.
-9. Repeat sync periodically.
+1. Mount SD storage first and display the first readable local JPEG before starting background tasks. Initial display does not wait for a full photo scan or catalog reconciliation.
+2. Reconcile the catalog in the sync task, then connect to Wi‑Fi. The display task remains responsible for slideshow rendering; a fallback runs only tasks that could not be created.
+3. Load stored refresh token and expiry from NVS.
+4. If token is expired, refresh it. If refresh fails, begin device-code login.
+5. Call OneDrive Graph to list the folder contents.
+6. Sort files by last modified time descending.
+7. Download newest files until the configured storage quota is reached.
+8. Delete oldest local files when quota is exceeded.
+9. Continue displaying images from the SD card in slideshow mode.
+10. Repeat sync periodically.
+
+Slide intervals begin after rendering finishes, so a slow decode does not trigger an immediate second render. Failed images also wait one interval before the next attempt. JPEG decoding yields periodically for watchdog safety without delaying every block row.
 
 ## 5. Recommended folder structure
 

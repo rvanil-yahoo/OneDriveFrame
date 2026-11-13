@@ -349,6 +349,17 @@ bool PhotoStorage::begin() {
     }
   }
 
+  isMounted_ = true;
+  Serial.printf("[Storage] SD ready at %lu ms; catalog initialization deferred until after first display.\n",
+                static_cast<unsigned long>(millis()));
+  return true;
+}
+
+bool PhotoStorage::initializeCatalog() {
+  if (!isMounted_) {
+    Serial.println("[Storage] Cannot initialize catalog before mounting SD.");
+    return false;
+  }
   Serial.println("[Storage] Initializing SQLite photo catalog...");
   if (!catalog_.begin()) {
     Serial.println("[Storage] Failed to initialize photo catalog.");
@@ -361,8 +372,6 @@ bool PhotoStorage::begin() {
     return false;
   }
 
-  isMounted_ = true;
-  Serial.println("[Storage] SD card mounted and photo directory ready.");
   return true;
 }
 
@@ -412,7 +421,7 @@ bool PhotoStorage::pruneOldestPhotos() {
   return currentUsageBytes() <= kMaxLocalUsageBytes;
 }
 
-bool PhotoStorage::refreshPhotoList() {
+bool PhotoStorage::refreshPhotoList(bool firstPhotoOnly) {
   photoFileCount_ = 0;
   File root = SD.open(kPhotoDirectory);
   if (!root || !root.isDirectory()) {
@@ -451,6 +460,10 @@ bool PhotoStorage::refreshPhotoList() {
 
       if (photoFileCount_ < kMaxPhotoFiles) {
         photoFiles_[photoFileCount_++] = path;
+        if (firstPhotoOnly) {
+          entry.close();
+          break;
+        }
       }
     }
     entry.close();
@@ -539,9 +552,11 @@ bool PhotoStorage::decodeJpegToRgb565(const String& sourcePath, uint16_t targetW
         }
         gDecodedImage.pixels[static_cast<size_t>(drawY) * gDecodedImage.width + drawX] = bitmap[row * blockW + col];
       }
-      if ((row % 8) == 0) {
-        vTaskDelay(1);
-      }
+    }
+    static uint32_t lastYieldMs = 0;
+    if (millis() - lastYieldMs >= 10UL) {
+      vTaskDelay(1);
+      lastYieldMs = millis();
     }
     return true;
   });
@@ -698,7 +713,7 @@ void PhotoStorage::displaySlideshow() {
     return;
   }
 
-  if (!refreshPhotoList() || photoFileCount_ == 0) {
+  if (!refreshPhotoList(lastSlideAtMs_ == 0) || photoFileCount_ == 0) {
     static uint32_t lastNoPhotoLogMs = 0;
     if (lastNoPhotoLogMs == 0 || now - lastNoPhotoLogMs > 10000UL) {
       Serial.println("[Display] No JPEG photos available for slideshow.");
@@ -710,7 +725,14 @@ void PhotoStorage::displaySlideshow() {
   const String path = photoFiles_[slideshowIndex_];
   slideshowIndex_ = (slideshowIndex_ + 1) % photoFileCount_;
   if (showPhoto(path)) {
-    lastSlideAtMs_ = now;
+    lastSlideAtMs_ = millis();
+    Serial.printf("[Display] Slide committed at %lu ms, render took %lu ms; holding for %lu ms.\n",
+                  static_cast<unsigned long>(lastSlideAtMs_),
+                  static_cast<unsigned long>(lastSlideAtMs_ - now),
+                  static_cast<unsigned long>(kSlideDurationMs));
+  } else {
+    lastSlideAtMs_ = millis();
+    Serial.println("[Display] Render failed; waiting one slide interval before trying again.");
   }
 }
 

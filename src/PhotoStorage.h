@@ -10,12 +10,13 @@ namespace odf {
 class PhotoStorage {
  public:
   bool begin();
+  bool initializeCatalog();
   uint64_t currentUsageBytes() const;
   bool pruneOldestPhotos();
   void displaySlideshow();
 
  private:
-  bool refreshPhotoList();
+  bool refreshPhotoList(bool firstPhotoOnly = false);
   bool showPhoto(const String& path);
   bool decodeJpegToRgb565(const String& sourcePath, uint16_t targetW, uint16_t targetH,
                           std::unique_ptr<uint16_t[]>& pixels, uint16_t& outW, uint16_t& outH);

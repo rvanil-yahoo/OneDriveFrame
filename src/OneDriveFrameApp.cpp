@@ -6,13 +6,12 @@ namespace odf {
 
 void OneDriveFrameApp::setup() {
   Serial.begin(115200);
-  delay(1000);
   printBootBanner();
   Serial.println("[Boot] Enabling dual-core mode (display on core 0, sync on core 1).");
 
   photoStorageMutex_ = xSemaphoreCreateMutex();
   if (photoStorageMutex_ == nullptr) {
-    Serial.println("[Boot] Failed to create photo storage mutex; continuing in single-core fallback mode.");
+    Serial.println("[Boot] Failed to create photo storage mutex; startup halted.");
     return;
   }
 
@@ -63,18 +62,26 @@ void OneDriveFrameApp::setup() {
   }
 
   if (!displayTaskStarted_.load() || !syncTaskStarted_.load()) {
-    Serial.println("[Boot] Task startup incomplete; using single-core fallback in loop().");
+    Serial.println("[Boot] Task startup incomplete; loop() will run only the missing task.");
   }
 }
 
 void OneDriveFrameApp::loop() {
+  if (photoStorageMutex_ == nullptr) {
+    delay(1000);
+    return;
+  }
   if (displayTaskStarted_.load() && syncTaskStarted_.load()) {
     delay(1000);
     return;
   }
 
-  runDisplayStep();
-  runSyncStep();
+  if (!displayTaskStarted_.load()) {
+    runDisplayStep();
+  }
+  if (!syncTaskStarted_.load()) {
+    runSyncStep();
+  }
   delay(250);
 }
 
@@ -126,13 +133,22 @@ void OneDriveFrameApp::runDisplayStep() {
 
 void OneDriveFrameApp::runSyncStep() {
   switch (state_) {
-    case AppState::kStart:
+    case AppState::kStart: {
       logStateTransition("START");
+      xSemaphoreTake(photoStorageMutex_, portMAX_DELAY);
+      const bool catalogReady = photoStorage_.initializeCatalog();
+      xSemaphoreGive(photoStorageMutex_);
+      if (!catalogReady) {
+        Serial.println("[Storage] Catalog not ready; delaying synchronization.");
+        delay(1000);
+        break;
+      }
       if (!tokenStoreInitialized_) {
         tokenStoreInitialized_ = tokenStore_.begin();
       }
       state_ = AppState::kWifiConnect;
       break;
+    }
 
     case AppState::kWifiConnect:
       logStateTransition("WIFI_CONNECT");
