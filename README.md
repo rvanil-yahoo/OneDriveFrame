@@ -15,6 +15,8 @@ Curate your photos in OneDrive; the frame keeps local copies on an SD card and r
 - Downloads staged as `.part` files before publishing the completed image.
 - SQLite photo metadata on SD and saved authentication tokens in NVS.
 
+![5 inch 800x480 LCD Display](displaylcd.jpg)
+
 ## Hardware and parts
 
 | Part | Purpose |
