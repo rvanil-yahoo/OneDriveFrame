@@ -26,6 +26,10 @@ constexpr uint32_t kWifiPortalTimeoutMs = 300000UL;
 constexpr uint32_t kSyncIntervalMs = 3UL * 60UL * 60UL * 1000UL;
 constexpr uint32_t kSlideDurationMs = 8UL * 1000UL;
 constexpr uint8_t kDisplayRotation = 1;
+// RGB scan-out tuning (board default: 10 lines, 15 MHz). Lines * 800 must evenly divide 800*480/2.
+// Each extra line costs 3.2 KB of internal RAM (two bounce buffers).
+constexpr uint32_t kDisplayBounceBufferLines = 16;
+constexpr uint32_t kDisplayPixelClockHz = 13UL * 1000UL * 1000UL;
 constexpr bool kEnableDisplayOutput = true;
 constexpr uint32_t kMaxLocalUsageBytes = 4UL * 1024UL * 1024UL * 1024UL;
 constexpr uint32_t kDefaultDeviceCodePollMs = 5000UL;

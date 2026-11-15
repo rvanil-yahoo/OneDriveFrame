@@ -667,6 +667,14 @@ void PhotoStorage::displaySlideshow() {
       esp_panel::drivers::LCD* lcdForConfig = gDisplayBoard->getLCD();
       if (lcdForConfig != nullptr) {
         lcdForConfig->configFrameBufferNumber(1);
+        // Scan-out headroom: the bounce-buffer refill ISR copies from the PSRAM framebuffer and can miss its
+        // deadline while sync (TLS/SD) traffic contends for PSRAM, showing a one-frame band or shift.
+        // A larger bounce buffer and slightly lower pixel clock give the refill more time per chunk.
+        auto* rgbBus = static_cast<esp_panel::drivers::BusRGB*>(lcdForConfig->getBus());
+        if (rgbBus != nullptr) {
+          rgbBus->configRGB_BounceBufferSize(kDisplayBounceBufferLines * 800U);
+          rgbBus->configRGB_FreqHz(kDisplayPixelClockHz);
+        }
       }
 
       bool boardReady = false;

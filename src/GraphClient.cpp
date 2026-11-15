@@ -699,8 +699,12 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
               break;
             }
             if (offset < written) {
+              // history is a ring indexed by absolute file position; restore may wrap into two writes.
               const size_t missing = written - offset;
-              if (outFile.write(history + historyLen - missing, missing) != missing) {
+              const size_t start = offset % kResumeHistorySize;
+              const size_t firstLen = min(missing, kResumeHistorySize - start);
+              if (outFile.write(history + start, firstLen) != firstLen ||
+                  outFile.write(history, missing - firstLen) != missing - firstLen) {
                 Serial.println("[Graph] SD retry failed while restoring recent bytes.");
                 continue;
               }
@@ -723,14 +727,14 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
           writeFailed = true;
           break;
         }
-        written += chunkLen;
-        if (historyLen + chunkLen > kResumeHistorySize) {
-          const size_t drop = historyLen + chunkLen - kResumeHistorySize;
-          memmove(history, history + drop, historyLen - drop);
-          historyLen -= drop;
+        {
+          const size_t start = written % kResumeHistorySize;
+          const size_t firstLen = min(chunkLen, kResumeHistorySize - start);
+          memcpy(history + start, buffer, firstLen);
+          memcpy(history, buffer + firstLen, chunkLen - firstLen);
         }
-        memcpy(history + historyLen, buffer, chunkLen);
-        historyLen += chunkLen;
+        written += chunkLen;
+        historyLen = min(written, kResumeHistorySize);
         if (remaining > 0) {
           remaining -= readBytes;
         }
