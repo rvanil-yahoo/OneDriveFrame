@@ -5,6 +5,7 @@
 #include <SD.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp_heap_caps.h>
 
 #include "FrameConfig.h"
 
@@ -14,6 +15,50 @@ namespace {
 
 constexpr const char* kPlaceholderClientId = "00000000-0000-0000-0000-000000000000";
 constexpr size_t kHttpBufferSize = 2048;
+
+class StorageLock {
+ public:
+  explicit StorageLock(SemaphoreHandle_t mutex) : mutex_(mutex) {
+    if (mutex_ != nullptr) {
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+    }
+  }
+  ~StorageLock() {
+    if (mutex_ != nullptr) {
+      xSemaphoreGive(mutex_);
+    }
+  }
+  StorageLock(const StorageLock&) = delete;
+  StorageLock& operator=(const StorageLock&) = delete;
+
+ private:
+  SemaphoreHandle_t mutex_;
+};
+
+bool endsWithJpegEoi(File& file) {
+  const size_t size = file.size();
+  if (size < 4) {
+    return false;
+  }
+  // Some encoders pad after EOI; scan the last few bytes for FF D9.
+  const size_t tailLen = size < 32 ? size : 32;
+  uint8_t tail[32];
+  if (!file.seek(size - tailLen) || file.read(tail, tailLen) != static_cast<int>(tailLen)) {
+    return false;
+  }
+  for (size_t i = tailLen - 1; i > 0; --i) {
+    if (tail[i - 1] == 0xFF && tail[i] == 0xD9) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool isJpegName(const String& name) {
+  String lower = name;
+  lower.toLowerCase();
+  return lower.endsWith(".jpg") || lower.endsWith(".jpeg");
+}
 
 void trimAtFirstNul(String& payload);
 
@@ -225,7 +270,8 @@ bool getWithBearer(const String& url, const String& token, int& statusCode, Stri
       Serial.print(attempt + 1);
       Serial.print("/");
       Serial.print(kMaxRetries + 1);
-      Serial.println(")");
+      Serial.printf(") internalFree=%u largest=%u\n", static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                    static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
       if (attempt < kMaxRetries) {
         delay(1500UL * (attempt + 1));
         continue;
@@ -323,15 +369,23 @@ bool GraphClient::listFolder(const OAuthToken& token) {
     Serial.println("[Graph] Missing access token.");
     return false;
   }
-  if (!catalog_.begin()) {
-    Serial.println("[Graph] Failed to initialize photo catalog.");
-    return false;
+  {
+    StorageLock lock(storageMutex_);
+    if (!catalog_.begin()) {
+      Serial.println("[Graph] Failed to initialize photo catalog.");
+      return false;
+    }
   }
 
   Serial.println("[Graph] Listing OneDrive folder: " + String(kOneDriveFolderName));
   String endpoint = String(kGraphBaseUrl) + "/me/drive/root:/" + urlEncode(String(kOneDriveFolderName)) + ":/children";
   endpoint += "?$top=25&$select=id,name,size,lastModifiedDateTime,eTag,file,image,photo";
-  if (!catalog_.beginRemoteSync()) {
+  bool remoteSyncStarted = false;
+  {
+    StorageLock lock(storageMutex_);
+    remoteSyncStarted = catalog_.beginRemoteSync();
+  }
+  if (!remoteSyncStarted) {
     Serial.println("[Graph] Failed to reset remote catalog presence flags.");
     return false;
   }
@@ -379,6 +433,7 @@ bool GraphClient::listFolder(const OAuthToken& token) {
       return false;
     }
 
+    StorageLock pageLock(storageMutex_);
     for (JsonVariant item : items) {
       ++totalChildren;
       const bool isFile = !item["file"].isNull();
@@ -497,21 +552,26 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     Serial.print(photo.sizeBytes);
     Serial.println(" bytes)");
 
-    if (SD.exists(filePath)) {
-      File existing = SD.open(filePath, FILE_READ);
-      if (existing && existing.size() == photo.sizeBytes) {
-        existing.close();
-        Serial.println("[Graph] Skipping unchanged file: " + photo.name);
-        ++successCount;
-        continue;
+    {
+      StorageLock lock(storageMutex_);
+      if (SD.exists(filePath)) {
+        File existing = SD.open(filePath, FILE_READ);
+        const bool sizeMatches = existing && existing.size() == photo.sizeBytes;
+        const bool contentOk = sizeMatches && (!isJpegName(photo.name) || endsWithJpegEoi(existing));
+        if (existing) {
+          existing.close();
+        }
+        if (contentOk) {
+          Serial.println("[Graph] Skipping unchanged file: " + photo.name);
+          ++successCount;
+          continue;
+        }
+        Serial.println("[Graph] Local copy missing/incomplete; re-downloading: " + photo.name);
+        SD.remove(filePath);
       }
-      if (existing) {
-        existing.close();
+      if (SD.exists(tempFilePath)) {
+        SD.remove(tempFilePath);
       }
-      SD.remove(filePath);
-    }
-    if (SD.exists(tempFilePath)) {
-      SD.remove(tempFilePath);
     }
 
     String effectiveUrl;
@@ -528,8 +588,7 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     Serial.println(filePath);
     Serial.print("[Graph] Download expected size: ");
     Serial.print(photo.sizeBytes);
-    Serial.print(" bytes, local path exists before write: ");
-    Serial.println(SD.exists(filePath) ? "yes" : "no");
+    Serial.println(" bytes");
 
 
     WiFiClientSecure client;
@@ -573,7 +632,11 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
       continue;
     }
 
-    File outFile = SD.open(tempFilePath, FILE_WRITE);
+    File outFile;
+    {
+      StorageLock lock(storageMutex_);
+      outFile = SD.open(tempFilePath, FILE_WRITE);
+    }
     if (!outFile) {
       Serial.println("[Graph] Failed to open SD temp file for write: " + tempFilePath);
       http.end();
@@ -581,56 +644,176 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     }
 
     auto* stream = http.getStreamPtr();
-    uint8_t buffer[kHttpBufferSize];
-    int remaining = http.getSize();
+    // Allocated once in PSRAM to keep internal RAM free for TLS; only the sync task downloads.
+    static uint8_t* buffer = static_cast<uint8_t*>(ps_malloc(kHttpBufferSize));
+    // Recent bytes kept so a retry can rewrite data FATFS lost from its buffers after an I/O error.
+    constexpr size_t kResumeHistorySize = 8192;
+    static uint8_t* history = static_cast<uint8_t*>(ps_malloc(kResumeHistorySize));
+    if (buffer == nullptr || history == nullptr) {
+      Serial.println("[Graph] Failed to allocate download buffers.");
+      {
+        StorageLock lock(storageMutex_);
+        outFile.close();
+        SD.remove(tempFilePath);
+      }
+      http.end();
+      return false;
+    }
+    size_t historyLen = 0;
+    const int contentLength = http.getSize();
+    int remaining = contentLength;
+    size_t received = 0;
     size_t written = 0;
-    uint32_t idleLoops = 0;
+    uint32_t lastDataMs = millis();
+    const char* exitReason = "complete";
+    bool writeFailed = false;
 
-    while (http.connected() && (remaining > 0 || remaining == -1)) {
+    while (remaining > 0 || remaining == -1) {
       const size_t available = stream->available();
       if (available > 0) {
-        const size_t toRead = available > sizeof(buffer) ? sizeof(buffer) : available;
+        const size_t toRead = available > kHttpBufferSize ? kHttpBufferSize : available;
         const int readBytes = stream->readBytes(buffer, toRead);
-        if (readBytes > 0) {
-          outFile.write(buffer, static_cast<size_t>(readBytes));
-          written += static_cast<size_t>(readBytes);
-          if (remaining > 0) {
-            remaining -= readBytes;
-          }
-          idleLoops = 0;
+        if (readBytes <= 0) {
+          continue;
         }
-      } else {
-        delay(1);
-        ++idleLoops;
-        if (idleLoops > 20000) {
+        const size_t chunkLen = static_cast<size_t>(readBytes);
+        received += chunkLen;
+        bool chunkOk = false;
+        for (int attempt = 0; attempt < 4; ++attempt) {
+          StorageLock lock(storageMutex_);
+          size_t offset = written;
+          if (attempt > 0) {
+            // FATFS handles stay failed after EIO and buffered tail data may be lost; reopen and resume
+            // from the real on-disk size using recently written bytes still held in memory.
+            outFile.close();
+            delay(250 * attempt);
+            outFile = SD.open(tempFilePath, FILE_APPEND);
+            if (!outFile) {
+              Serial.println("[Graph] SD reopen for retry failed.");
+              continue;
+            }
+            offset = outFile.size();
+            if (offset + historyLen < written || offset > written + chunkLen) {
+              Serial.printf("[Graph] SD retry cannot resume: onDisk=%u expected=%u.\n", static_cast<unsigned>(offset),
+                            static_cast<unsigned>(written));
+              break;
+            }
+            if (offset < written) {
+              const size_t missing = written - offset;
+              if (outFile.write(history + historyLen - missing, missing) != missing) {
+                Serial.println("[Graph] SD retry failed while restoring recent bytes.");
+                continue;
+              }
+              offset = written;
+            }
+          }
+          const size_t skip = offset - written;
+          errno = 0;
+          const size_t chunkWritten = outFile.write(buffer + skip, chunkLen - skip);
+          if (chunkWritten == chunkLen - skip) {
+            chunkOk = true;
+            break;
+          }
+          Serial.printf("[Graph] SD write failed at offset %u: wrote %u/%u errno=%d (%s), attempt %d/4\n",
+                        static_cast<unsigned>(offset), static_cast<unsigned>(chunkWritten),
+                        static_cast<unsigned>(chunkLen - skip), errno, strerror(errno), attempt + 1);
+        }
+        if (!chunkOk) {
+          exitReason = "sd-write-failed";
+          writeFailed = true;
           break;
         }
+        written += chunkLen;
+        if (historyLen + chunkLen > kResumeHistorySize) {
+          const size_t drop = historyLen + chunkLen - kResumeHistorySize;
+          memmove(history, history + drop, historyLen - drop);
+          historyLen -= drop;
+        }
+        memcpy(history + historyLen, buffer, chunkLen);
+        historyLen += chunkLen;
+        if (remaining > 0) {
+          remaining -= readBytes;
+        }
+        lastDataMs = millis();
+      } else if (!http.connected()) {
+        exitReason = remaining == -1 ? "connection-closed" : "connection-closed-early";
+        break;
+      } else if (millis() - lastDataMs > 20000UL) {
+        exitReason = "idle-timeout";
+        break;
+      } else {
+        delay(1);
       }
     }
 
-    outFile.close();
+    size_t fileSize = 0;
+    {
+      StorageLock lock(storageMutex_);
+      outFile.flush();
+      outFile.close();
+      File check = SD.open(tempFilePath, FILE_READ);
+      if (check) {
+        fileSize = check.size();
+        check.close();
+      }
+    }
     http.end();
 
-    if (photo.sizeBytes > 0 && written != photo.sizeBytes) {
-      Serial.print("[Graph] Incomplete download for ");
-      Serial.print(photo.name);
-      Serial.print(". expected=");
-      Serial.print(photo.sizeBytes);
-      Serial.print(" written=");
-      Serial.println(written);
+    const size_t expected = photo.sizeBytes > 0 ? photo.sizeBytes
+                                                : (contentLength > 0 ? static_cast<size_t>(contentLength) : 0);
+    Serial.print("[Graph] Download result for ");
+    Serial.print(photo.name);
+    Serial.print(": exit=");
+    Serial.print(exitReason);
+    Serial.print(" expected=");
+    Serial.print(expected);
+    Serial.print(" contentLength=");
+    Serial.print(contentLength);
+    Serial.print(" received=");
+    Serial.print(received);
+    Serial.print(" written=");
+    Serial.print(written);
+    Serial.print(" fileSize=");
+    Serial.println(fileSize);
+
+    bool valid = !writeFailed && expected > 0 && received == expected && written == expected && fileSize == expected;
+    if (contentLength > 0 && static_cast<size_t>(contentLength) != expected) {
+      valid = false;
+    }
+    if (valid && isJpegName(photo.name)) {
+      StorageLock lock(storageMutex_);
+      File check = SD.open(tempFilePath, FILE_READ);
+      valid = check && endsWithJpegEoi(check);
+      if (check) {
+        check.close();
+      }
+      if (!valid) {
+        Serial.println("[Graph] JPEG end marker (FFD9) missing; treating as incomplete.");
+      }
+    }
+
+    if (!valid) {
+      Serial.println("[Graph] Incomplete download discarded: " + photo.name);
+      StorageLock lock(storageMutex_);
       SD.remove(tempFilePath);
       continue;
     }
 
-    if (SD.exists(filePath) && !SD.remove(filePath)) {
-      Serial.println("[Graph] Failed to replace existing file: " + filePath);
-      SD.remove(tempFilePath);
-      continue;
-    }
-    if (!SD.rename(tempFilePath, filePath)) {
-      Serial.println("[Graph] Failed to rename temp file into place: " + photo.name);
-      SD.remove(tempFilePath);
-      continue;
+    {
+      StorageLock lock(storageMutex_);
+      if (SD.exists(filePath) && !SD.remove(filePath)) {
+        Serial.println("[Graph] Failed to replace existing file: " + filePath);
+        SD.remove(tempFilePath);
+        continue;
+      }
+      if (!SD.rename(tempFilePath, filePath)) {
+        Serial.println("[Graph] Failed to rename temp file into place: " + photo.name);
+        SD.remove(tempFilePath);
+        continue;
+      }
+      if (!catalog_.markDownloaded(photo.itemId, photo.name, filePath, static_cast<uint32_t>(written))) {
+        Serial.println("[Graph] Failed to mark download in catalog: " + photo.name);
+      }
     }
 
     Serial.print("[Graph] Saved ");
@@ -638,9 +821,6 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     Serial.print(" (");
     Serial.print(written);
     Serial.println(" bytes)");
-    if (!catalog_.markDownloaded(photo.itemId, photo.name, filePath, static_cast<uint32_t>(written))) {
-      Serial.println("[Graph] Failed to mark download in catalog: " + photo.name);
-    }
 
     ++successCount;
     Serial.print("[Graph] Download progress: ");

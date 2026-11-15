@@ -1,6 +1,8 @@
 #pragma once
 
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include "PhotoCatalog.h"
 #include "OAuthToken.h"
@@ -9,6 +11,8 @@ namespace odf {
 
 class GraphClient {
  public:
+  // SD card access is shared with the display task; all SD/catalog work is serialized via this mutex.
+  void setStorageMutex(SemaphoreHandle_t mutex) { storageMutex_ = mutex; }
   bool listFolder(const OAuthToken& token);
   bool downloadNewestPhotos(const OAuthToken& token);
   bool refreshAccessToken(OAuthToken& token);
@@ -32,6 +36,7 @@ class GraphClient {
   size_t pendingPhotoCount_ = 0;
   PhotoCatalog catalog_;
   bool authFailure_ = false;
+  SemaphoreHandle_t storageMutex_ = nullptr;
 };
 
 }  // namespace odf

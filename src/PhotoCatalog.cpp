@@ -75,33 +75,40 @@ bool PhotoCatalog::openDatabase() {
 }
 
 bool PhotoCatalog::execute(const char* sql) {
-  sqlite3* db = nullptr;
-  int rc = sqlite3_open(kCatalogPath, &db);
-  if (rc != SQLITE_OK) {
-    Serial.print("[Catalog] sqlite3_open failed: ");
-    Serial.println(sqlite3_errstr(rc));
-    if (db != nullptr) {
-      sqlite3_close(db);
+  // SPI SD writes intermittently fail with EIO when the card stays busy; retry I/O errors a few times.
+  constexpr int kMaxAttempts = 3;
+  for (int attempt = 1;; ++attempt) {
+    sqlite3* db = nullptr;
+    int rc = sqlite3_open(kCatalogPath, &db);
+    if (rc != SQLITE_OK) {
+      Serial.print("[Catalog] sqlite3_open failed: ");
+      Serial.println(sqlite3_errstr(rc));
+      if (db != nullptr) {
+        sqlite3_close(db);
+      }
+      return false;
     }
-    return false;
-  }
 
-  char* errorMessage = nullptr;
-  rc = sqlite3_exec(db, sql, nullptr, nullptr, &errorMessage);
-  if (rc != SQLITE_OK) {
+    char* errorMessage = nullptr;
+    rc = sqlite3_exec(db, sql, nullptr, nullptr, &errorMessage);
+    sqlite3_close(db);
+    if (rc == SQLITE_OK) {
+      return true;
+    }
+
     Serial.print("[Catalog] sqlite3_exec failed: ");
     if (errorMessage != nullptr) {
-      Serial.println(errorMessage);
+      Serial.print(errorMessage);
       sqlite3_free(errorMessage);
     } else {
-      Serial.println(sqlite3_errstr(rc));
+      Serial.print(sqlite3_errstr(rc));
     }
-    sqlite3_close(db);
-    return false;
+    Serial.printf(" (attempt %d/%d)\n", attempt, kMaxAttempts);
+    if ((rc & 0xFF) != SQLITE_IOERR || attempt >= kMaxAttempts) {
+      return false;
+    }
+    delay(250 * attempt);
   }
-
-  sqlite3_close(db);
-  return true;
 }
 
 bool PhotoCatalog::createSchema() {

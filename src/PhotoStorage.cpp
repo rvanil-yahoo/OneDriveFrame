@@ -432,7 +432,11 @@ bool PhotoStorage::refreshPhotoList(bool firstPhotoOnly) {
   }
 
   File entry = root.openNextFile();
+  size_t scanned = 0;
   while (entry) {
+    if ((++scanned & 0x0F) == 0) {
+      vTaskDelay(1);
+    }
     if (!entry.isDirectory()) {
       String path = String(entry.path());
       if (!isJpegFile(path)) {
@@ -441,9 +445,11 @@ bool PhotoStorage::refreshPhotoList(bool firstPhotoOnly) {
         continue;
       }
 
+      // Header probing every file is too slow for large libraries; full scans defer validation to render time.
       uint16_t testW = 0;
       uint16_t testH = 0;
-      const JRESULT sizeResult = TJpgDec.getSdJpgSize(&testW, &testH, path.c_str());
+      const JRESULT sizeResult =
+          firstPhotoOnly ? TJpgDec.getSdJpgSize(&testW, &testH, path.c_str()) : JDR_OK;
       if (sizeResult != JDR_OK) {
         Serial.print("[Display] Skipping unreadable JPEG file: ");
         Serial.print(path);
@@ -724,11 +730,14 @@ void PhotoStorage::displaySlideshow() {
 
   const String path = photoFiles_[slideshowIndex_];
   slideshowIndex_ = (slideshowIndex_ + 1) % photoFileCount_;
+  const uint32_t scanDoneMs = millis();
   if (showPhoto(path)) {
     lastSlideAtMs_ = millis();
-    Serial.printf("[Display] Slide committed at %lu ms, render took %lu ms; holding for %lu ms.\n",
+    Serial.printf("[Display] Slide committed at %lu ms (%u files): scan %lu ms, render %lu ms; holding for %lu ms.\n",
                   static_cast<unsigned long>(lastSlideAtMs_),
-                  static_cast<unsigned long>(lastSlideAtMs_ - now),
+                  static_cast<unsigned>(photoFileCount_),
+                  static_cast<unsigned long>(scanDoneMs - now),
+                  static_cast<unsigned long>(lastSlideAtMs_ - scanDoneMs),
                   static_cast<unsigned long>(kSlideDurationMs));
   } else {
     lastSlideAtMs_ = millis();
