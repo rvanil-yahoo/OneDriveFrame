@@ -71,6 +71,8 @@ The default sync interval is **three hours**. Local photos remain available when
 
 JPEGs are decoded with TJpg_Decoder, resized in memory, and supplied to an LVGL image widget. No display-ready image files are generated.
 
+The panel uses its native 800 x 480 landscape orientation with no axis swapping or mirroring, so text reads normally.
+
 Images retain their aspect ratio and fit inside the screen:
 
 - Wide landscape photos can use the full 800-pixel width.

@@ -701,9 +701,12 @@ void PhotoStorage::displaySlideshow() {
       if (gLcd == nullptr) {
         Serial.println("[Display] LCD driver unavailable after board init.");
       } else {
-        gLcd->swapXY(false);
-        gLcd->mirrorX(kDisplayRotation == 1 || kDisplayRotation == 2);
-        gLcd->mirrorY(kDisplayRotation == 2 || kDisplayRotation == 3);
+        // The panel is natively 800x480; a single-axis mirror is not a rotation.
+        if (!gLcd->swapXY(false) || !gLcd->mirrorX(false) || !gLcd->mirrorY(false)) {
+          Serial.println("[Display] Failed to set native landscape orientation.");
+          return;
+        }
+        Serial.println("[Display] Native landscape orientation: swapXY=0 mirrorX=0 mirrorY=0.");
         if (gLcd->isFunctionSupported(esp_panel::drivers::LCD::BasicBusSpecification::FUNC_DISPLAY_ON_OFF)) {
           gLcd->setDisplayOnOff(true);
         }
