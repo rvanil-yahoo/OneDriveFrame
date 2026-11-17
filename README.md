@@ -4,6 +4,28 @@ A standalone ESP32-S3 photo frame that downloads pictures from a Microsoft OneDr
 
 Curate your photos in OneDrive; the frame keeps local copies on an SD card and runs a slideshow without a PC or hosted backend. Existing SD photos are displayed before network setup, so viewing does not depend on signing in or completing a sync.
 
+## Why this project
+
+Showing my OneDrive photos on a digital frame turned out to be harder than it should be. I tried a Raspberry Pi, a full x86 PC, and several commercial frames, and each one fell short in a different way:
+
+- **Unreliable:** they stopped syncing, hung, or needed regular attention.
+- **Missing features:** each one did part of what I needed but never all of it.
+- **Hard to set up:** they needed extra software, accounts, or ongoing maintenance.
+- **Didn't scale:** none of them coped well with a growing photo library.
+
+I wanted something simpler: a frame that shows whatever is in one OneDrive folder, with no server, PC, or cloud service of my own to look after.
+
+## The approach
+
+OneDriveFrame is a self-contained photo frame built on a small ESP32-S3 display board:
+
+- **Curate in OneDrive:** add or remove photos in a dedicated `ESP32Frame` folder, and the frame does the rest.
+- **Direct and serverless:** the device signs in to your Microsoft account once, then syncs the folder directly through Microsoft Graph.
+- **Works offline:** photos are stored on the SD card, so the slideshow keeps running without Wi‑Fi and starts within seconds of power-on.
+- **Reliable downloads:** every file is checked before it is shown, and interrupted or corrupted downloads are retried automatically.
+- **Clean rendering:** photos are scaled to fit the screen without cropping, using LVGL for rendering.
+- **Portable:** the design can move to other ESP32 display boards and screen sizes with little change.
+
 ## Features
 
 - Microsoft personal-account sign-in through the OAuth device-code flow.
@@ -12,7 +34,7 @@ Curate your photos in OneDrive; the frame keeps local copies on an SD card and r
 - Local JPEG slideshow using an LVGL image widget.
 - Aspect-ratio-preserving resizing and centering on a black background.
 - Separate display and sync tasks pinned to the ESP32-S3's two cores.
-- Downloads staged as `.part` files before publishing the completed image.
+- Downloads staged as `.part` files and published only after size and JPEG end-marker checks pass, with automatic recovery from SD write errors.
 - SQLite photo metadata on SD and saved authentication tokens in NVS.
 
 ![5 inch 800x480 LCD Display](displaylcd.jpg)
