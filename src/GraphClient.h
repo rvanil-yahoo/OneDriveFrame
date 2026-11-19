@@ -13,6 +13,7 @@ class GraphClient {
  public:
   // SD card access is shared with the display task; all SD/catalog work is serialized via this mutex.
   void setStorageMutex(SemaphoreHandle_t mutex) { storageMutex_ = mutex; }
+  void setCatalog(PhotoCatalog* catalog) { catalog_ = catalog; }
   bool listFolder(const OAuthToken& token);
   bool downloadNewestPhotos(const OAuthToken& token);
   bool refreshAccessToken(OAuthToken& token);
@@ -34,7 +35,7 @@ class GraphClient {
 
   PendingPhoto pendingPhotos_[128];
   size_t pendingPhotoCount_ = 0;
-  PhotoCatalog catalog_;
+  PhotoCatalog* catalog_ = nullptr;
   bool authFailure_ = false;
   SemaphoreHandle_t storageMutex_ = nullptr;
 };

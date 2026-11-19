@@ -361,13 +361,17 @@ bool PhotoStorage::initializeCatalog() {
     return false;
   }
   Serial.println("[Storage] Initializing SQLite photo catalog...");
-  if (!catalog_.begin()) {
+  if (catalog_ == nullptr) {
+    Serial.println("[Storage] Photo catalog is not configured.");
+    return false;
+  }
+  if (!catalog_->begin()) {
     Serial.println("[Storage] Failed to initialize photo catalog.");
     Serial.println("[Storage] Verify /sd/photos path is writable and catalog.db can be created.");
     return false;
   }
   Serial.println("[Storage] Reconciling catalog with current SD files...");
-  if (!catalog_.reconcileWithStorage()) {
+  if (!catalog_->reconcileWithStorage()) {
     Serial.println("[Storage] Failed to reconcile photo catalog.");
     return false;
   }
@@ -376,13 +380,14 @@ bool PhotoStorage::initializeCatalog() {
 }
 
 uint64_t PhotoStorage::currentUsageBytes() const {
-  return const_cast<PhotoCatalog&>(catalog_).totalLocalBytes();
+  return catalog_ == nullptr ? 0 : catalog_->totalLocalBytes();
 }
 
 bool PhotoStorage::pruneOldestPhotos() {
   size_t removedStaleCount = 0;
   uint64_t removedStaleBytes = 0;
-  if (!catalog_.removeFilesNotInRemoteCatalog(removedStaleCount, removedStaleBytes)) {
+  if (catalog_ == nullptr ||
+      !catalog_->removeFilesNotInRemoteCatalog(removedStaleCount, removedStaleBytes)) {
     Serial.println("[Storage] Failed to prune files missing from remote catalog.");
     return false;
   }
@@ -403,7 +408,7 @@ bool PhotoStorage::pruneOldestPhotos() {
 
   size_t removedQuotaCount = 0;
   uint64_t removedQuotaBytes = 0;
-  if (!catalog_.pruneOldestLocalFilesToQuota(kMaxLocalUsageBytes, removedQuotaCount, removedQuotaBytes)) {
+  if (!catalog_->pruneOldestLocalFilesToQuota(kMaxLocalUsageBytes, removedQuotaCount, removedQuotaBytes)) {
     Serial.println("[Storage] Failed to prune oldest local files to quota.");
     return false;
   }

@@ -2,6 +2,9 @@
 
 #include <Arduino.h>
 
+struct sqlite3;
+struct sqlite3_stmt;
+
 namespace odf {
 
 class PhotoCatalog {
@@ -19,7 +22,16 @@ class PhotoCatalog {
     uint32_t sizeBytes = 0;
   };
 
+  PhotoCatalog() = default;
+  ~PhotoCatalog();
+  PhotoCatalog(const PhotoCatalog&) = delete;
+  PhotoCatalog& operator=(const PhotoCatalog&) = delete;
+
   bool begin();
+  void end();
+  bool beginTransaction();
+  bool commitTransaction();
+  bool rollbackTransaction();
   bool reconcileWithStorage();
   bool beginRemoteSync();
   bool upsertRemotePhoto(const RemotePhotoMetadata& metadata);
@@ -32,8 +44,25 @@ class PhotoCatalog {
   bool openDatabase();
   bool createSchema();
   bool execute(const char* sql);
+  bool prepareStatements();
+  void finalizeStatements();
+  void closeDatabase();
+  bool stepUpsertRemote(sqlite3_stmt* statement, const RemotePhotoMetadata& metadata, bool matchItemId);
+  bool stepMarkDownloaded(sqlite3_stmt* statement, const String& itemId, const String& filename,
+                          const String& localPath, uint32_t sizeBytes, bool matchItemId);
 
   bool initialized_ = false;
+  bool transactionActive_ = false;
+  sqlite3* database_ = nullptr;
+  sqlite3_stmt* reconcileUpdate_ = nullptr;
+  sqlite3_stmt* reconcileInsert_ = nullptr;
+  sqlite3_stmt* remoteUpdate_ = nullptr;
+  sqlite3_stmt* remoteAdopt_ = nullptr;
+  sqlite3_stmt* remoteInsert_ = nullptr;
+  sqlite3_stmt* downloadUpdate_ = nullptr;
+  sqlite3_stmt* downloadAdopt_ = nullptr;
+  sqlite3_stmt* downloadInsert_ = nullptr;
+  sqlite3_stmt* markMissing_ = nullptr;
 };
 
 }  // namespace odf

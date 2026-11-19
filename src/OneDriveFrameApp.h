@@ -35,6 +35,7 @@ class OneDriveFrameApp {
   TokenStore tokenStore_;
   GraphClient graphClient_;
   PhotoStorage photoStorage_;
+  PhotoCatalog photoCatalog_;
   WifiSetupManager wifiSetupManager_;
   uint32_t lastSuccessfulSyncMs_ = 0;
   uint32_t lastStorageRetryMs_ = 0;

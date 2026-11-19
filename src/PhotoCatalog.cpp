@@ -14,6 +14,13 @@ namespace {
 
 constexpr const char* kCatalogPath = "/sd/catalog.db";
 
+void resetStatement(sqlite3_stmt* statement) {
+  if (statement != nullptr) {
+    sqlite3_reset(statement);
+    sqlite3_clear_bindings(statement);
+  }
+}
+
 bool bindNullableText(sqlite3_stmt* stmt, int index, const String& value) {
   if (value.isEmpty()) {
     return sqlite3_bind_null(stmt, index) == SQLITE_OK;
@@ -37,7 +44,6 @@ bool hasColumn(sqlite3* db, const char* tableName, const char* columnName) {
       break;
     }
   }
-
   sqlite3_finalize(stmt);
   return found;
 }
@@ -48,63 +54,72 @@ void logSqliteError(const char* context, sqlite3* db, int rc) {
   Serial.print(" failed (");
   Serial.print(rc);
   Serial.print("): ");
-  if (db != nullptr) {
-    Serial.println(sqlite3_errmsg(db));
-  } else {
-    Serial.println(sqlite3_errstr(rc));
-  }
+  Serial.println(db != nullptr ? sqlite3_errmsg(db) : sqlite3_errstr(rc));
 }
 
 }  // namespace
 
+PhotoCatalog::~PhotoCatalog() {
+  end();
+}
+
 bool PhotoCatalog::openDatabase() {
-  Serial.print("[Catalog] Opening DB: ");
+  if (database_ != nullptr) {
+    return true;
+  }
+
+  Serial.print("[Catalog] Opening persistent DB: ");
   Serial.println(kCatalogPath);
-  sqlite3* db = nullptr;
-  const int rc = sqlite3_open(kCatalogPath, &db);
+  const int rc = sqlite3_open(kCatalogPath, &database_);
   if (rc != SQLITE_OK) {
-    Serial.print("[Catalog] Failed opening DB: ");
-    Serial.println(sqlite3_errstr(rc));
-    if (db != nullptr) {
-      sqlite3_close(db);
-    }
+    logSqliteError("open database", database_, rc);
+    closeDatabase();
     return false;
   }
-  sqlite3_close(db);
+  sqlite3_busy_timeout(database_, 1000);
+  if (!execute("PRAGMA synchronous=NORMAL;PRAGMA temp_store=MEMORY;PRAGMA cache_size=-4096;")) {
+    closeDatabase();
+    return false;
+  }
   return true;
 }
 
-bool PhotoCatalog::execute(const char* sql) {
-  // SPI SD writes intermittently fail with EIO when the card stays busy; retry I/O errors a few times.
-  constexpr int kMaxAttempts = 3;
-  for (int attempt = 1;; ++attempt) {
-    sqlite3* db = nullptr;
-    int rc = sqlite3_open(kCatalogPath, &db);
-    if (rc != SQLITE_OK) {
-      Serial.print("[Catalog] sqlite3_open failed: ");
-      Serial.println(sqlite3_errstr(rc));
-      if (db != nullptr) {
-        sqlite3_close(db);
-      }
-      return false;
-    }
+void PhotoCatalog::closeDatabase() {
+  if (database_ == nullptr) {
+    return;
+  }
+  if (transactionActive_) {
+    sqlite3_exec(database_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    transactionActive_ = false;
+  }
+  finalizeStatements();
+  sqlite3_close(database_);
+  database_ = nullptr;
+}
 
+void PhotoCatalog::end() {
+  closeDatabase();
+  initialized_ = false;
+}
+
+bool PhotoCatalog::execute(const char* sql) {
+  constexpr int kMaxAttempts = 3;
+  if (database_ == nullptr) {
+    return false;
+  }
+
+  for (int attempt = 1;; ++attempt) {
     char* errorMessage = nullptr;
-    rc = sqlite3_exec(db, sql, nullptr, nullptr, &errorMessage);
-    sqlite3_close(db);
+    const int rc = sqlite3_exec(database_, sql, nullptr, nullptr, &errorMessage);
     if (rc == SQLITE_OK) {
       return true;
     }
 
     Serial.print("[Catalog] sqlite3_exec failed: ");
-    if (errorMessage != nullptr) {
-      Serial.print(errorMessage);
-      sqlite3_free(errorMessage);
-    } else {
-      Serial.print(sqlite3_errstr(rc));
-    }
+    Serial.print(errorMessage != nullptr ? errorMessage : sqlite3_errstr(rc));
+    sqlite3_free(errorMessage);
     Serial.printf(" (attempt %d/%d)\n", attempt, kMaxAttempts);
-    if ((rc & 0xFF) != SQLITE_IOERR || attempt >= kMaxAttempts) {
+    if (((rc & 0xFF) != SQLITE_IOERR && rc != SQLITE_BUSY) || attempt >= kMaxAttempts) {
       return false;
     }
     delay(250 * attempt);
@@ -139,148 +154,220 @@ bool PhotoCatalog::createSchema() {
     return false;
   }
 
-  sqlite3* db = nullptr;
-  int rc = sqlite3_open(kCatalogPath, &db);
-  if (rc != SQLITE_OK) {
-    logSqliteError("open for schema migration", db, rc);
-    if (db != nullptr) {
-      sqlite3_close(db);
+  struct Migration {
+    const char* column;
+    const char* sql;
+  };
+  static constexpr Migration kMigrations[] = {
+      {"remote_present", "ALTER TABLE photos ADD COLUMN remote_present INTEGER NOT NULL DEFAULT 0;"},
+  };
+  for (const Migration& migration : kMigrations) {
+    if (hasColumn(database_, "photos", migration.column)) {
+      continue;
     }
-    return false;
-  }
-
-  if (!hasColumn(db, "photos", "remote_present")) {
-    Serial.println("[Catalog] Applying schema migration: add remote_present.");
-    char* errorMessage = nullptr;
-    rc = sqlite3_exec(db, "ALTER TABLE photos ADD COLUMN remote_present INTEGER NOT NULL DEFAULT 0;", nullptr, nullptr,
-                      &errorMessage);
-    if (rc != SQLITE_OK) {
-      bool duplicateColumn = false;
-      if (errorMessage != nullptr && strstr(errorMessage, "duplicate column name") != nullptr) {
-        duplicateColumn = true;
-      }
-      if (!duplicateColumn) {
-        logSqliteError("alter table add remote_present", db, rc);
-        if (errorMessage != nullptr) {
+    bool migrated = false;
+    for (int attempt = 1; attempt <= 3 && !migrated; ++attempt) {
+      char* errorMessage = nullptr;
+      const int rc = sqlite3_exec(database_, migration.sql, nullptr, nullptr, &errorMessage);
+      if (rc == SQLITE_OK ||
+          (errorMessage != nullptr && strstr(errorMessage, "duplicate column name") != nullptr)) {
+        migrated = true;
+      } else {
+        Serial.print("[Catalog] Schema migration ");
+        Serial.print(migration.column);
+        Serial.print(" failed: ");
+        Serial.print(errorMessage != nullptr ? errorMessage : sqlite3_errstr(rc));
+        Serial.printf(" (attempt %d/3)\n", attempt);
+        if (attempt < 3 && (rc == SQLITE_BUSY || (rc & 0xFF) == SQLITE_IOERR)) {
+          delay(250 * attempt);
+        } else {
           sqlite3_free(errorMessage);
+          return false;
         }
-        sqlite3_close(db);
-        return false;
       }
-      if (errorMessage != nullptr) {
-        sqlite3_free(errorMessage);
-      }
+      sqlite3_free(errorMessage);
+    }
+    if (!migrated) {
+      return false;
     }
   }
 
-  sqlite3_close(db);
   return true;
+}
+
+bool PhotoCatalog::prepareStatements() {
+  const auto prepare = [this](sqlite3_stmt** statement, const char* sql, const char* name) {
+    const int rc = sqlite3_prepare_v2(database_, sql, -1, statement, nullptr);
+    if (rc != SQLITE_OK) {
+      logSqliteError(name, database_, rc);
+      return false;
+    }
+    return true;
+  };
+
+  return prepare(&reconcileUpdate_, "UPDATE photos SET local_present=1, size_bytes=? WHERE local_path=?;",
+                 "prepare reconcile update") &&
+         prepare(&reconcileInsert_,
+                 "INSERT INTO photos(item_id, filename, local_path, size_bytes, local_present, downloaded_utc) "
+                 "VALUES(NULL, ?, ?, ?, 1, datetime('now'));",
+                 "prepare reconcile insert") &&
+         prepare(&remoteUpdate_,
+                 "UPDATE photos SET filename=?, local_path=?, size_bytes=?, width=?, height=?, orientation=?, "
+                 "last_modified_utc=?, etag=?, mime_type=?, remote_present=1 WHERE item_id=?;",
+                 "prepare remote update") &&
+         prepare(&remoteAdopt_,
+                 "UPDATE photos SET item_id=?, filename=?, size_bytes=?, width=?, height=?, orientation=?, "
+                 "last_modified_utc=?, etag=?, mime_type=?, remote_present=1 "
+                 "WHERE local_path=?;",
+                 "prepare remote adopt") &&
+         prepare(&remoteInsert_,
+                 "INSERT INTO photos(item_id, filename, local_path, size_bytes, width, height, orientation, "
+                 "last_modified_utc, etag, mime_type, remote_present, local_present) "
+                 "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0);",
+                 "prepare remote insert") &&
+         prepare(&downloadUpdate_,
+                 "UPDATE photos SET local_present=1, remote_present=1, filename=?, local_path=?, "
+                 "size_bytes=?, downloaded_utc=datetime('now') "
+                 "WHERE item_id=?;",
+                 "prepare download update") &&
+         prepare(&downloadAdopt_,
+                 "UPDATE photos SET item_id=?, filename=?, size_bytes=?, local_present=1, remote_present=1, "
+                 "downloaded_utc=datetime('now') "
+                 "WHERE local_path=?;",
+                 "prepare download adopt") &&
+         prepare(&downloadInsert_,
+                 "INSERT INTO photos(item_id, filename, local_path, size_bytes, local_present, remote_present, "
+                 "downloaded_utc) VALUES(?, ?, ?, ?, 1, 1, datetime('now'));",
+                 "prepare download insert") &&
+         prepare(&markMissing_, "UPDATE photos SET local_present=0 WHERE id=?;",
+                 "prepare mark missing");
+}
+
+void PhotoCatalog::finalizeStatements() {
+  sqlite3_finalize(reconcileUpdate_);
+  sqlite3_finalize(reconcileInsert_);
+  sqlite3_finalize(remoteUpdate_);
+  sqlite3_finalize(remoteAdopt_);
+  sqlite3_finalize(remoteInsert_);
+  sqlite3_finalize(downloadUpdate_);
+  sqlite3_finalize(downloadAdopt_);
+  sqlite3_finalize(downloadInsert_);
+  sqlite3_finalize(markMissing_);
+  reconcileUpdate_ = nullptr;
+  reconcileInsert_ = nullptr;
+  remoteUpdate_ = nullptr;
+  remoteAdopt_ = nullptr;
+  remoteInsert_ = nullptr;
+  downloadUpdate_ = nullptr;
+  downloadAdopt_ = nullptr;
+  downloadInsert_ = nullptr;
+  markMissing_ = nullptr;
 }
 
 bool PhotoCatalog::begin() {
-  if (initialized_) {
+  if (initialized_ && database_ != nullptr) {
     return true;
   }
-
-  Serial.println("[Catalog] begin() start");
-  if (!openDatabase()) {
-    Serial.println("[Catalog] begin() failed in openDatabase().");
+  if (!openDatabase() || !createSchema() || !prepareStatements()) {
+    closeDatabase();
+    initialized_ = false;
     return false;
   }
-
-  if (!createSchema()) {
-    Serial.println("[Catalog] begin() failed in createSchema().");
-    return false;
-  }
-
   initialized_ = true;
-  Serial.println("[Catalog] SQLite catalog ready.");
+  Serial.println("[Catalog] SQLite catalog ready with persistent prepared statements.");
   return true;
 }
 
+bool PhotoCatalog::beginTransaction() {
+  if (!initialized_ || database_ == nullptr || transactionActive_) {
+    return false;
+  }
+  if (!execute("BEGIN IMMEDIATE;")) {
+    return false;
+  }
+  transactionActive_ = true;
+  return true;
+}
+
+bool PhotoCatalog::commitTransaction() {
+  if (!transactionActive_ || !execute("COMMIT;")) {
+    return false;
+  }
+  transactionActive_ = false;
+  return true;
+}
+
+bool PhotoCatalog::rollbackTransaction() {
+  if (!transactionActive_) {
+    return true;
+  }
+  const bool ok = execute("ROLLBACK;");
+  if (ok) {
+    transactionActive_ = false;
+  }
+  return ok;
+}
+
 bool PhotoCatalog::reconcileWithStorage() {
-  if (!initialized_ && !begin()) {
+  if ((!initialized_ && !begin()) || !beginTransaction()) {
     return false;
   }
-
-  if (!execute("UPDATE photos SET local_present = 0;")) {
-    return false;
-  }
-
-  sqlite3* db = nullptr;
-  int rc = sqlite3_open(kCatalogPath, &db);
-  if (rc != SQLITE_OK) {
-    Serial.print("[Catalog] sqlite3_open failed: ");
-    Serial.println(sqlite3_errstr(rc));
-    if (db != nullptr) {
-      sqlite3_close(db);
-    }
-    return false;
-  }
-
-  sqlite3_stmt* updateStmt = nullptr;
-  sqlite3_stmt* insertStmt = nullptr;
-
-  const char* updateSql = "UPDATE photos SET local_present=1, size_bytes=? WHERE local_path=?;";
-  rc = sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nullptr);
-  if (rc != SQLITE_OK) {
-    Serial.println("[Catalog] Failed to prepare update statement.");
-    sqlite3_close(db);
-    return false;
-  }
-
-  const char* insertSql =
-      "INSERT INTO photos(item_id, filename, local_path, size_bytes, local_present, downloaded_utc) "
-      "VALUES(NULL, ?, ?, ?, 1, datetime('now'));";
-  rc = sqlite3_prepare_v2(db, insertSql, -1, &insertStmt, nullptr);
-  if (rc != SQLITE_OK) {
-    Serial.println("[Catalog] Failed to prepare insert statement.");
-    sqlite3_finalize(updateStmt);
-    sqlite3_close(db);
-    return false;
-  }
-
+  bool ok = execute("UPDATE photos SET local_present=0;");
   File root = SD.open(kPhotoDirectory);
-  if (root && root.isDirectory()) {
-    File entry = root.openNextFile();
-    while (entry) {
-      if (!entry.isDirectory()) {
-        const String filename = String(entry.name());
-        const String localPath = String(kPhotoDirectory) + "/" + filename;
-        if (!localPath.endsWith("/catalog.db")) {
-          const int64_t sizeBytes = static_cast<int64_t>(entry.size());
+  if (!root || !root.isDirectory()) {
+    if (root) {
+      root.close();
+    }
+    rollbackTransaction();
+    return false;
+  }
 
-          sqlite3_bind_int64(updateStmt, 1, sizeBytes);
-          sqlite3_bind_text(updateStmt, 2, localPath.c_str(), -1, SQLITE_TRANSIENT);
-          rc = sqlite3_step(updateStmt);
-          sqlite3_reset(updateStmt);
-          sqlite3_clear_bindings(updateStmt);
-
+  size_t files = 0;
+  File entry = root.openNextFile();
+  while (ok && entry) {
+    if (!entry.isDirectory()) {
+      const String filename = String(entry.name());
+      const String localPath = String(kPhotoDirectory) + "/" + filename;
+      if (!localPath.endsWith(".part")) {
+        resetStatement(reconcileUpdate_);
+        sqlite3_bind_int64(reconcileUpdate_, 1, static_cast<int64_t>(entry.size()));
+        sqlite3_bind_text(reconcileUpdate_, 2, localPath.c_str(), -1, SQLITE_TRANSIENT);
+        int rc = sqlite3_step(reconcileUpdate_);
+        const bool updateDone = rc == SQLITE_DONE;
+        const bool existsInCatalog = updateDone && sqlite3_changes(database_) > 0;
+        if (!existsInCatalog) {
+          resetStatement(reconcileInsert_);
+          sqlite3_bind_text(reconcileInsert_, 1, filename.c_str(), -1, SQLITE_TRANSIENT);
+          sqlite3_bind_text(reconcileInsert_, 2, localPath.c_str(), -1, SQLITE_TRANSIENT);
+          sqlite3_bind_int64(reconcileInsert_, 3, static_cast<int64_t>(entry.size()));
+          rc = sqlite3_step(reconcileInsert_);
           if (rc != SQLITE_DONE) {
-            Serial.println("[Catalog] Failed updating local_present during reconcile.");
-          } else if (sqlite3_changes(db) == 0) {
-            sqlite3_bind_text(insertStmt, 1, filename.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(insertStmt, 2, localPath.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(insertStmt, 3, sizeBytes);
-            rc = sqlite3_step(insertStmt);
-            sqlite3_reset(insertStmt);
-            sqlite3_clear_bindings(insertStmt);
-            if (rc != SQLITE_DONE) {
-              Serial.println("[Catalog] Failed inserting local-only file into catalog.");
-            }
+            logSqliteError("insert local file", database_, rc);
+            ok = false;
           }
+        } else if (!updateDone) {
+          logSqliteError("update local file", database_, rc);
+          ok = false;
+        }
+        if (ok) {
+          ++files;
         }
       }
-      entry.close();
-      entry = root.openNextFile();
     }
-    root.close();
+    entry.close();
+    entry = root.openNextFile();
+    if ((files & 0x0F) == 0) {
+      vTaskDelay(1);
+    }
   }
+  root.close();
 
-  sqlite3_finalize(updateStmt);
-  sqlite3_finalize(insertStmt);
-  sqlite3_close(db);
-  Serial.println("[Catalog] Reconciled catalog with SD files.");
+  if (!ok || !commitTransaction()) {
+    rollbackTransaction();
+    Serial.println("[Catalog] Storage reconciliation rolled back.");
+    return false;
+  }
+  Serial.printf("[Catalog] Reconciled catalog with %u SD files.\n", static_cast<unsigned>(files));
   return true;
 }
 
@@ -288,229 +375,141 @@ bool PhotoCatalog::beginRemoteSync() {
   if (!initialized_ && !begin()) {
     return false;
   }
-  return execute("UPDATE photos SET remote_present = 0 WHERE item_id IS NOT NULL;");
+  return execute("UPDATE photos SET remote_present=0 WHERE item_id IS NOT NULL;");
+}
+
+bool PhotoCatalog::stepUpsertRemote(sqlite3_stmt* statement, const RemotePhotoMetadata& metadata, bool matchItemId) {
+  resetStatement(statement);
+  int index = 1;
+  if (!matchItemId) {
+    bindNullableText(statement, index++, metadata.itemId);
+  }
+  bindNullableText(statement, index++, metadata.filename);
+  if (matchItemId) {
+    bindNullableText(statement, index++, metadata.localPath);
+  }
+  sqlite3_bind_int64(statement, index++, static_cast<int64_t>(metadata.sizeBytes));
+  metadata.width >= 0 ? sqlite3_bind_int(statement, index, metadata.width) : sqlite3_bind_null(statement, index);
+  ++index;
+  metadata.height >= 0 ? sqlite3_bind_int(statement, index, metadata.height) : sqlite3_bind_null(statement, index);
+  ++index;
+  bindNullableText(statement, index++, metadata.orientation);
+  bindNullableText(statement, index++, metadata.modifiedUtc);
+  bindNullableText(statement, index++, metadata.etag);
+  bindNullableText(statement, index++, metadata.mimeType);
+  bindNullableText(statement, index++, matchItemId ? metadata.itemId : metadata.localPath);
+
+  const int rc = sqlite3_step(statement);
+  if (rc != SQLITE_DONE) {
+    logSqliteError("upsert remote metadata", database_, rc);
+    return false;
+  }
+  return true;
 }
 
 bool PhotoCatalog::upsertRemotePhoto(const RemotePhotoMetadata& metadata) {
   if (!initialized_ && !begin()) {
     return false;
   }
-
-  sqlite3* db = nullptr;
-  int rc = sqlite3_open(kCatalogPath, &db);
-  if (rc != SQLITE_OK) {
-    Serial.print("[Catalog] sqlite3_open failed: ");
-    Serial.println(sqlite3_errstr(rc));
-    if (db != nullptr) {
-      sqlite3_close(db);
-    }
+  if (!stepUpsertRemote(remoteUpdate_, metadata, true)) {
     return false;
   }
-
-  const char* updateSql =
-      "UPDATE photos SET filename=?, local_path=?, size_bytes=?, width=?, height=?, orientation=?, "
-      "last_modified_utc=?, etag=?, mime_type=?, remote_present=1 WHERE item_id=?;";
-  sqlite3_stmt* updateStmt = nullptr;
-  rc = sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nullptr);
-  if (rc != SQLITE_OK) {
-    logSqliteError("prepare remote metadata update", db, rc);
-    sqlite3_close(db);
-    return false;
-  }
-
-  bindNullableText(updateStmt, 1, metadata.filename);
-  bindNullableText(updateStmt, 2, metadata.localPath);
-  sqlite3_bind_int64(updateStmt, 3, static_cast<int64_t>(metadata.sizeBytes));
-  if (metadata.width >= 0) {
-    sqlite3_bind_int(updateStmt, 4, metadata.width);
-  } else {
-    sqlite3_bind_null(updateStmt, 4);
-  }
-  if (metadata.height >= 0) {
-    sqlite3_bind_int(updateStmt, 5, metadata.height);
-  } else {
-    sqlite3_bind_null(updateStmt, 5);
-  }
-  bindNullableText(updateStmt, 6, metadata.orientation);
-  bindNullableText(updateStmt, 7, metadata.modifiedUtc);
-  bindNullableText(updateStmt, 8, metadata.etag);
-  bindNullableText(updateStmt, 9, metadata.mimeType);
-  bindNullableText(updateStmt, 10, metadata.itemId);
-
-  rc = sqlite3_step(updateStmt);
-  sqlite3_finalize(updateStmt);
-  if (rc != SQLITE_DONE) {
-    logSqliteError("update remote metadata", db, rc);
-    sqlite3_close(db);
-    return false;
-  }
-
-  if (sqlite3_changes(db) == 0) {
-    const char* adoptSql =
-        "UPDATE photos SET item_id=?, filename=?, size_bytes=?, width=?, height=?, orientation=?, "
-        "last_modified_utc=?, etag=?, mime_type=?, remote_present=1 WHERE local_path=?;";
-    sqlite3_stmt* adoptStmt = nullptr;
-    rc = sqlite3_prepare_v2(db, adoptSql, -1, &adoptStmt, nullptr);
-    if (rc != SQLITE_OK) {
-      logSqliteError("prepare remote metadata adopt", db, rc);
-      sqlite3_close(db);
-      return false;
-    }
-
-    bindNullableText(adoptStmt, 1, metadata.itemId);
-    bindNullableText(adoptStmt, 2, metadata.filename);
-    sqlite3_bind_int64(adoptStmt, 3, static_cast<int64_t>(metadata.sizeBytes));
-    if (metadata.width >= 0) {
-      sqlite3_bind_int(adoptStmt, 4, metadata.width);
-    } else {
-      sqlite3_bind_null(adoptStmt, 4);
-    }
-    if (metadata.height >= 0) {
-      sqlite3_bind_int(adoptStmt, 5, metadata.height);
-    } else {
-      sqlite3_bind_null(adoptStmt, 5);
-    }
-    bindNullableText(adoptStmt, 6, metadata.orientation);
-    bindNullableText(adoptStmt, 7, metadata.modifiedUtc);
-    bindNullableText(adoptStmt, 8, metadata.etag);
-    bindNullableText(adoptStmt, 9, metadata.mimeType);
-    bindNullableText(adoptStmt, 10, metadata.localPath);
-
-    rc = sqlite3_step(adoptStmt);
-    sqlite3_finalize(adoptStmt);
-    if (rc != SQLITE_DONE) {
-      logSqliteError("adopt local row for remote metadata", db, rc);
-      sqlite3_close(db);
+  if (sqlite3_changes(database_) == 0) {
+    resetStatement(remoteAdopt_);
+    int index = 1;
+    bindNullableText(remoteAdopt_, index++, metadata.itemId);
+    bindNullableText(remoteAdopt_, index++, metadata.filename);
+    sqlite3_bind_int64(remoteAdopt_, index++, static_cast<int64_t>(metadata.sizeBytes));
+    metadata.width >= 0 ? sqlite3_bind_int(remoteAdopt_, index, metadata.width) : sqlite3_bind_null(remoteAdopt_, index);
+    ++index;
+    metadata.height >= 0 ? sqlite3_bind_int(remoteAdopt_, index, metadata.height)
+                         : sqlite3_bind_null(remoteAdopt_, index);
+    ++index;
+    bindNullableText(remoteAdopt_, index++, metadata.orientation);
+    bindNullableText(remoteAdopt_, index++, metadata.modifiedUtc);
+    bindNullableText(remoteAdopt_, index++, metadata.etag);
+    bindNullableText(remoteAdopt_, index++, metadata.mimeType);
+    bindNullableText(remoteAdopt_, index++, metadata.localPath);
+    const int adoptRc = sqlite3_step(remoteAdopt_);
+    if (adoptRc != SQLITE_DONE) {
+      logSqliteError("adopt local metadata", database_, adoptRc);
       return false;
     }
   }
-
-  if (sqlite3_changes(db) == 0) {
-    const char* insertSql =
-        "INSERT INTO photos(item_id, filename, local_path, size_bytes, width, height, orientation, "
-        "last_modified_utc, etag, mime_type, remote_present, local_present) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0);";
-    sqlite3_stmt* insertStmt = nullptr;
-    rc = sqlite3_prepare_v2(db, insertSql, -1, &insertStmt, nullptr);
-    if (rc != SQLITE_OK) {
-      logSqliteError("prepare remote metadata insert", db, rc);
-      sqlite3_close(db);
-      return false;
-    }
-
-    bindNullableText(insertStmt, 1, metadata.itemId);
-    bindNullableText(insertStmt, 2, metadata.filename);
-    bindNullableText(insertStmt, 3, metadata.localPath);
-    sqlite3_bind_int64(insertStmt, 4, static_cast<int64_t>(metadata.sizeBytes));
-    if (metadata.width >= 0) {
-      sqlite3_bind_int(insertStmt, 5, metadata.width);
-    } else {
-      sqlite3_bind_null(insertStmt, 5);
-    }
-    if (metadata.height >= 0) {
-      sqlite3_bind_int(insertStmt, 6, metadata.height);
-    } else {
-      sqlite3_bind_null(insertStmt, 6);
-    }
-    bindNullableText(insertStmt, 7, metadata.orientation);
-    bindNullableText(insertStmt, 8, metadata.modifiedUtc);
-    bindNullableText(insertStmt, 9, metadata.etag);
-    bindNullableText(insertStmt, 10, metadata.mimeType);
-
-    rc = sqlite3_step(insertStmt);
-    sqlite3_finalize(insertStmt);
-    if (rc != SQLITE_DONE) {
-      logSqliteError("insert remote metadata", db, rc);
-      sqlite3_close(db);
+  if (sqlite3_changes(database_) == 0) {
+    resetStatement(remoteInsert_);
+    int index = 1;
+    bindNullableText(remoteInsert_, index++, metadata.itemId);
+    bindNullableText(remoteInsert_, index++, metadata.filename);
+    bindNullableText(remoteInsert_, index++, metadata.localPath);
+    sqlite3_bind_int64(remoteInsert_, index++, static_cast<int64_t>(metadata.sizeBytes));
+    metadata.width >= 0 ? sqlite3_bind_int(remoteInsert_, index, metadata.width) : sqlite3_bind_null(remoteInsert_, index);
+    ++index;
+    metadata.height >= 0 ? sqlite3_bind_int(remoteInsert_, index, metadata.height)
+                         : sqlite3_bind_null(remoteInsert_, index);
+    ++index;
+    bindNullableText(remoteInsert_, index++, metadata.orientation);
+    bindNullableText(remoteInsert_, index++, metadata.modifiedUtc);
+    bindNullableText(remoteInsert_, index++, metadata.etag);
+    bindNullableText(remoteInsert_, index, metadata.mimeType);
+    const int insertRc = sqlite3_step(remoteInsert_);
+    if (insertRc != SQLITE_DONE) {
+      logSqliteError("insert remote metadata", database_, insertRc);
       return false;
     }
   }
-
-  sqlite3_close(db);
   return true;
 }
 
-bool PhotoCatalog::markDownloaded(const String& itemId, const String& filename, const String& localPath, uint32_t sizeBytes) {
+bool PhotoCatalog::stepMarkDownloaded(sqlite3_stmt* statement, const String& itemId, const String& filename,
+                                      const String& localPath, uint32_t sizeBytes, bool matchItemId) {
+  resetStatement(statement);
+  int index = 1;
+  if (!matchItemId) {
+    bindNullableText(statement, index++, itemId);
+  }
+  bindNullableText(statement, index++, filename);
+  if (matchItemId) {
+    bindNullableText(statement, index++, localPath);
+  }
+  sqlite3_bind_int64(statement, index++, static_cast<int64_t>(sizeBytes));
+  if (matchItemId) {
+    bindNullableText(statement, index++, itemId);
+  } else {
+    bindNullableText(statement, index++, localPath);
+  }
+  const int rc = sqlite3_step(statement);
+  if (rc != SQLITE_DONE) {
+    logSqliteError("mark downloaded", database_, rc);
+    return false;
+  }
+  return true;
+}
+
+bool PhotoCatalog::markDownloaded(const String& itemId, const String& filename, const String& localPath,
+                                  uint32_t sizeBytes) {
   if (!initialized_ && !begin()) {
     return false;
   }
-
-  sqlite3* db = nullptr;
-  int rc = sqlite3_open(kCatalogPath, &db);
-  if (rc != SQLITE_OK) {
-    Serial.print("[Catalog] sqlite3_open failed: ");
-    Serial.println(sqlite3_errstr(rc));
-    if (db != nullptr) {
-      sqlite3_close(db);
-    }
+  if (!stepMarkDownloaded(downloadUpdate_, itemId, filename, localPath, sizeBytes, true)) {
     return false;
   }
-
-  const char* sql =
-      "UPDATE photos SET local_present=1, remote_present=1, filename=?, local_path=?, size_bytes=?, downloaded_utc=datetime('now') "
-      "WHERE item_id=?;";
-  sqlite3_stmt* updateStmt = nullptr;
-  rc = sqlite3_prepare_v2(db, sql, -1, &updateStmt, nullptr);
-  if (rc != SQLITE_OK) {
-    Serial.println("[Catalog] Failed to prepare markDownloaded update.");
-    sqlite3_close(db);
+  if (sqlite3_changes(database_) == 0 &&
+      !stepMarkDownloaded(downloadAdopt_, itemId, filename, localPath, sizeBytes, false)) {
     return false;
   }
-
-  bindNullableText(updateStmt, 1, filename);
-  bindNullableText(updateStmt, 2, localPath);
-  sqlite3_bind_int64(updateStmt, 3, static_cast<int64_t>(sizeBytes));
-  bindNullableText(updateStmt, 4, itemId);
-  rc = sqlite3_step(updateStmt);
-  sqlite3_finalize(updateStmt);
-  if (rc != SQLITE_DONE) {
-    sqlite3_close(db);
-    Serial.println("[Catalog] Failed updating downloaded state.");
-    return false;
-  }
-
-  if (sqlite3_changes(db) == 0) {
-    const char* adoptSql =
-        "UPDATE photos SET item_id=?, filename=?, size_bytes=?, local_present=1, remote_present=1, "
-        "downloaded_utc=datetime('now') WHERE local_path=?;";
-    sqlite3_stmt* adoptStmt = nullptr;
-    rc = sqlite3_prepare_v2(db, adoptSql, -1, &adoptStmt, nullptr);
-    if (rc == SQLITE_OK) {
-      bindNullableText(adoptStmt, 1, itemId);
-      bindNullableText(adoptStmt, 2, filename);
-      sqlite3_bind_int64(adoptStmt, 3, static_cast<int64_t>(sizeBytes));
-      bindNullableText(adoptStmt, 4, localPath);
-      rc = sqlite3_step(adoptStmt);
-      sqlite3_finalize(adoptStmt);
-    }
+  if (sqlite3_changes(database_) == 0) {
+    resetStatement(downloadInsert_);
+    bindNullableText(downloadInsert_, 1, itemId);
+    bindNullableText(downloadInsert_, 2, filename);
+    bindNullableText(downloadInsert_, 3, localPath);
+    sqlite3_bind_int64(downloadInsert_, 4, static_cast<int64_t>(sizeBytes));
+    const int rc = sqlite3_step(downloadInsert_);
     if (rc != SQLITE_DONE) {
-      sqlite3_close(db);
-      Serial.println("[Catalog] Failed adopting local row while marking download.");
+      logSqliteError("insert downloaded photo", database_, rc);
       return false;
     }
   }
-
-  if (sqlite3_changes(db) == 0) {
-    const char* insertSql =
-        "INSERT INTO photos(item_id, filename, local_path, size_bytes, local_present, remote_present, downloaded_utc) "
-        "VALUES(?, ?, ?, ?, 1, 1, datetime('now'));";
-    sqlite3_stmt* insertStmt = nullptr;
-    rc = sqlite3_prepare_v2(db, insertSql, -1, &insertStmt, nullptr);
-    if (rc == SQLITE_OK) {
-      bindNullableText(insertStmt, 1, itemId);
-      bindNullableText(insertStmt, 2, filename);
-      bindNullableText(insertStmt, 3, localPath);
-      sqlite3_bind_int64(insertStmt, 4, static_cast<int64_t>(sizeBytes));
-      rc = sqlite3_step(insertStmt);
-      sqlite3_finalize(insertStmt);
-    }
-    if (rc != SQLITE_DONE) {
-      sqlite3_close(db);
-      Serial.println("[Catalog] Failed inserting downloaded row.");
-      return false;
-    }
-  }
-
-  sqlite3_close(db);
   return true;
 }
 
@@ -521,165 +520,103 @@ bool PhotoCatalog::removeFilesNotInRemoteCatalog(size_t& deletedCount, uint64_t&
     return false;
   }
 
-  sqlite3* db = nullptr;
-  int rc = sqlite3_open(kCatalogPath, &db);
-  if (rc != SQLITE_OK) {
-    if (db != nullptr) {
-      sqlite3_close(db);
-    }
-    return false;
-  }
-
+  sqlite3_stmt* stmt = nullptr;
   const char* selectSql =
       "SELECT id, local_path, size_bytes, item_id FROM photos "
-      "WHERE local_present = 1 AND (item_id IS NULL OR remote_present = 0);";
-  sqlite3_stmt* stmt = nullptr;
-  rc = sqlite3_prepare_v2(db, selectSql, -1, &stmt, nullptr);
+      "WHERE local_present=1 AND (item_id IS NULL OR remote_present=0);";
+  int rc = sqlite3_prepare_v2(database_, selectSql, -1, &stmt, nullptr);
   if (rc != SQLITE_OK) {
-    sqlite3_close(db);
+    logSqliteError("prepare stale photo query", database_, rc);
     return false;
   }
 
   while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
     const int64_t rowId = sqlite3_column_int64(stmt, 0);
-    const char* localPathText = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+    const char* pathText = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
     const uint64_t sizeBytes = static_cast<uint64_t>(sqlite3_column_int64(stmt, 2));
-    const bool hasItemId = sqlite3_column_type(stmt, 3) != SQLITE_NULL;
-    if (localPathText == nullptr) {
+    if (pathText == nullptr) {
       continue;
     }
-    const String localPath(localPathText);
-    if (localPath.endsWith("/catalog.db")) {
-      continue;
-    }
-
-    if (SD.exists(localPath) && SD.remove(localPath)) {
+    const String path(pathText);
+    if (SD.exists(path) && SD.remove(path)) {
       ++deletedCount;
       freedBytes += sizeBytes;
     }
-
-    sqlite3_stmt* updateStmt = nullptr;
-    rc = sqlite3_prepare_v2(db, "UPDATE photos SET local_present=0 WHERE id=?;", -1, &updateStmt, nullptr);
-    if (rc == SQLITE_OK) {
-      sqlite3_bind_int64(updateStmt, 1, rowId);
-      sqlite3_step(updateStmt);
-      sqlite3_finalize(updateStmt);
-    } else if (updateStmt != nullptr) {
-      sqlite3_finalize(updateStmt);
+    resetStatement(markMissing_);
+    sqlite3_bind_int64(markMissing_, 1, rowId);
+    if (sqlite3_step(markMissing_) != SQLITE_DONE) {
+      sqlite3_finalize(stmt);
+      return false;
     }
-
-    if (!hasItemId) {
+    if (sqlite3_column_type(stmt, 3) == SQLITE_NULL) {
       sqlite3_stmt* deleteStmt = nullptr;
-      rc = sqlite3_prepare_v2(db, "DELETE FROM photos WHERE id=?;", -1, &deleteStmt, nullptr);
-      if (rc == SQLITE_OK) {
+      if (sqlite3_prepare_v2(database_, "DELETE FROM photos WHERE id=?;", -1, &deleteStmt, nullptr) == SQLITE_OK) {
         sqlite3_bind_int64(deleteStmt, 1, rowId);
         sqlite3_step(deleteStmt);
-        sqlite3_finalize(deleteStmt);
-      } else if (deleteStmt != nullptr) {
         sqlite3_finalize(deleteStmt);
       }
     }
   }
-
   sqlite3_finalize(stmt);
-  sqlite3_close(db);
-  return true;
+  return rc == SQLITE_DONE;
 }
 
 uint64_t PhotoCatalog::totalLocalBytes() {
   if (!initialized_ && !begin()) {
     return 0;
   }
-
-  sqlite3* db = nullptr;
-  int rc = sqlite3_open(kCatalogPath, &db);
-  if (rc != SQLITE_OK) {
-    if (db != nullptr) {
-      sqlite3_close(db);
-    }
-    return 0;
-  }
-
   sqlite3_stmt* stmt = nullptr;
-  rc = sqlite3_prepare_v2(db, "SELECT COALESCE(SUM(size_bytes),0) FROM photos WHERE local_present=1;", -1, &stmt, nullptr);
+  int rc = sqlite3_prepare_v2(database_,
+                              "SELECT COALESCE(SUM(size_bytes),0) FROM photos WHERE local_present=1;", -1, &stmt, nullptr);
   if (rc != SQLITE_OK) {
-    sqlite3_close(db);
     return 0;
   }
-
   uint64_t total = 0;
   if (sqlite3_step(stmt) == SQLITE_ROW) {
     total = static_cast<uint64_t>(sqlite3_column_int64(stmt, 0));
   }
   sqlite3_finalize(stmt);
-  sqlite3_close(db);
   return total;
 }
 
 bool PhotoCatalog::pruneOldestLocalFilesToQuota(uint64_t quotaBytes, size_t& deletedCount, uint64_t& deletedBytes) {
   deletedCount = 0;
   deletedBytes = 0;
-  if (!initialized_ && !begin()) {
-    return false;
-  }
-
   uint64_t usage = totalLocalBytes();
   if (usage <= quotaBytes) {
     return true;
   }
 
-  sqlite3* db = nullptr;
-  int rc = sqlite3_open(kCatalogPath, &db);
-  if (rc != SQLITE_OK) {
-    if (db != nullptr) {
-      sqlite3_close(db);
-    }
-    return false;
-  }
-
-  const char* selectSql =
-      "SELECT id, local_path, size_bytes FROM photos "
-      "WHERE local_present=1 "
-      "ORDER BY CASE WHEN last_modified_utc IS NULL THEN 1 ELSE 0 END, last_modified_utc ASC, id ASC;";
   sqlite3_stmt* stmt = nullptr;
-  rc = sqlite3_prepare_v2(db, selectSql, -1, &stmt, nullptr);
+  const char* selectSql =
+      "SELECT id, local_path, size_bytes FROM photos WHERE local_present=1 "
+      "ORDER BY CASE WHEN last_modified_utc IS NULL THEN 1 ELSE 0 END, last_modified_utc ASC, id ASC;";
+  int rc = sqlite3_prepare_v2(database_, selectSql, -1, &stmt, nullptr);
   if (rc != SQLITE_OK) {
-    sqlite3_close(db);
+    logSqliteError("prepare quota query", database_, rc);
     return false;
   }
-
-  while (usage > quotaBytes && sqlite3_step(stmt) == SQLITE_ROW) {
+  while (usage > quotaBytes && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
     const int64_t rowId = sqlite3_column_int64(stmt, 0);
-    const char* localPathText = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+    const char* pathText = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
     const uint64_t sizeBytes = static_cast<uint64_t>(sqlite3_column_int64(stmt, 2));
-    if (localPathText == nullptr) {
-      continue;
+    if (pathText != nullptr) {
+      const String path(pathText);
+      if (SD.exists(path) && SD.remove(path)) {
+        ++deletedCount;
+        deletedBytes += sizeBytes;
+        usage = usage > sizeBytes ? usage - sizeBytes : 0;
+      }
     }
-    const String localPath(localPathText);
-    if (localPath.endsWith("/catalog.db")) {
-      continue;
-    }
-
-    if (SD.exists(localPath) && SD.remove(localPath)) {
-      ++deletedCount;
-      deletedBytes += sizeBytes;
-      usage = usage > sizeBytes ? usage - sizeBytes : 0;
-    }
-
-    sqlite3_stmt* updateStmt = nullptr;
-    rc = sqlite3_prepare_v2(db, "UPDATE photos SET local_present=0 WHERE id=?;", -1, &updateStmt, nullptr);
-    if (rc == SQLITE_OK) {
-      sqlite3_bind_int64(updateStmt, 1, rowId);
-      sqlite3_step(updateStmt);
-      sqlite3_finalize(updateStmt);
-    } else if (updateStmt != nullptr) {
-      sqlite3_finalize(updateStmt);
+    resetStatement(markMissing_);
+    sqlite3_bind_int64(markMissing_, 1, rowId);
+    if (sqlite3_step(markMissing_) != SQLITE_DONE) {
+      sqlite3_finalize(stmt);
+      return false;
     }
   }
-
   sqlite3_finalize(stmt);
-  sqlite3_close(db);
-  return true;
+  return rc == SQLITE_DONE || rc == SQLITE_ROW;
 }
 
 }  // namespace odf

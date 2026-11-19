@@ -9,6 +9,7 @@ namespace odf {
 
 class PhotoStorage {
  public:
+  void setCatalog(PhotoCatalog* catalog) { catalog_ = catalog; }
   bool begin();
   bool initializeCatalog();
   uint64_t currentUsageBytes() const;
@@ -28,7 +29,7 @@ class PhotoStorage {
   size_t slideshowIndex_ = 0;
   uint32_t lastSlideAtMs_ = 0;
   String photoFiles_[kMaxPhotoFiles];
-  PhotoCatalog catalog_;
+  PhotoCatalog* catalog_ = nullptr;
 };
 
 }  // namespace odf

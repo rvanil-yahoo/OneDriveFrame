@@ -371,7 +371,7 @@ bool GraphClient::listFolder(const OAuthToken& token) {
   }
   {
     StorageLock lock(storageMutex_);
-    if (!catalog_.begin()) {
+    if (catalog_ == nullptr || !catalog_->begin()) {
       Serial.println("[Graph] Failed to initialize photo catalog.");
       return false;
     }
@@ -383,7 +383,7 @@ bool GraphClient::listFolder(const OAuthToken& token) {
   bool remoteSyncStarted = false;
   {
     StorageLock lock(storageMutex_);
-    remoteSyncStarted = catalog_.beginRemoteSync();
+    remoteSyncStarted = catalog_->beginRemoteSync();
   }
   if (!remoteSyncStarted) {
     Serial.println("[Graph] Failed to reset remote catalog presence flags.");
@@ -434,6 +434,11 @@ bool GraphClient::listFolder(const OAuthToken& token) {
     }
 
     StorageLock pageLock(storageMutex_);
+    if (!catalog_->beginTransaction()) {
+      Serial.println("[Graph] Failed to begin catalog transaction for folder page.");
+      return false;
+    }
+    bool pageOk = true;
     for (JsonVariant item : items) {
       ++totalChildren;
       const bool isFile = !item["file"].isNull();
@@ -468,10 +473,12 @@ bool GraphClient::listFolder(const OAuthToken& token) {
       metadata.height = height;
       metadata.orientation = orientation;
       metadata.sizeBytes = sizeBytes;
-      if (catalog_.upsertRemotePhoto(metadata)) {
+      if (catalog_->upsertRemotePhoto(metadata)) {
         ++cataloged;
       } else {
         Serial.println("[Graph] Catalog upsert failed for: " + name);
+        pageOk = false;
+        break;
       }
 
       if (pendingPhotoCount_ >= (sizeof(pendingPhotos_) / sizeof(pendingPhotos_[0]))) {
@@ -491,6 +498,11 @@ bool GraphClient::listFolder(const OAuthToken& token) {
       ++pendingPhotoCount_;
     }
 
+    if (!pageOk || !catalog_->commitTransaction()) {
+      catalog_->rollbackTransaction();
+      Serial.println("[Graph] Catalog page transaction rolled back.");
+      return false;
+    }
     endpoint = doc["@odata.nextLink"] | "";
   }
 
@@ -815,7 +827,8 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
         SD.remove(tempFilePath);
         continue;
       }
-      if (!catalog_.markDownloaded(photo.itemId, photo.name, filePath, static_cast<uint32_t>(written))) {
+      if (catalog_ == nullptr ||
+          !catalog_->markDownloaded(photo.itemId, photo.name, filePath, static_cast<uint32_t>(written))) {
         Serial.println("[Graph] Failed to mark download in catalog: " + photo.name);
       }
     }

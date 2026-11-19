@@ -173,9 +173,11 @@ SQLite database at `/sd/catalog.db`, table `photos`:
 | `local_present` | File currently on SD |
 | `downloaded_utc` | When the file was last saved |
 
-Indexes exist on `item_id`, `last_modified_utc`, `local_present`, and `size_bytes`. A migration adds `remote_present` to older databases. Each operation opens and closes the DB, and `execute()` retries `SQLITE_IOERR` up to 3 times.
+Indexes exist on `item_id`, `last_modified_utc`, `local_present`, and `size_bytes`. Older databases are migrated in place when `remote_present` is missing. The app owns one persistent connection shared by Graph and storage; its prepared statements cover reconciliation, remote upserts, and downloaded-file state. `execute()` retries `SQLITE_IOERR` and `SQLITE_BUSY` up to 3 times.
 
 `reconcileWithStorage()` (run at START) marks every row `local_present = 0`, then walks `/photos` and marks or inserts each file found.
+
+The shared-connection foundation is complete; the in-memory 128-photo download queue and 256-photo slideshow list remain active until later steps. Queue-state fields and sync-version migrations will be designed with the download step, because this embedded SQLite build cannot safely alter the existing table through a large schema migration.
 
 ## 7. Display pipeline
 

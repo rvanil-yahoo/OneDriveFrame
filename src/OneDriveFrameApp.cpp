@@ -14,6 +14,8 @@ void OneDriveFrameApp::setup() {
     Serial.println("[Boot] Failed to create photo storage mutex; startup halted.");
     return;
   }
+  graphClient_.setCatalog(&photoCatalog_);
+  photoStorage_.setCatalog(&photoCatalog_);
   graphClient_.setStorageMutex(photoStorageMutex_);
 
   Serial.println("[Boot] Waiting for mission-critical storage initialization...");
