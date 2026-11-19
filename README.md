@@ -101,7 +101,7 @@ Images retain their aspect ratio and fit inside the screen:
 - Portrait photos can use the full 480-pixel height.
 - A 4:3 landscape photo fits at 640 x 480 rather than being cropped.
 
-Unused screen space is black. Each successfully rendered slide remains visible for the configured interval, **eight seconds** by default.
+Unused screen space is black. Each successfully rendered slide remains visible for the configured interval, **ten seconds** by default.
 
 ## Getting started
 
@@ -157,7 +157,7 @@ Libraries include the Arduino ESP32 framework, LVGL 8, TJpg_Decoder, ESP32_Displ
 ## Current limitations
 
 - The slideshow supports `.jpg` and `.jpeg`. The downloader also accepts PNG files, but PNG rendering is not implemented.
-- The download queue holds 128 images per sync pass; the slideshow list holds up to 256 files.
+- Downloads and slideshow selection use the SQLite catalog without fixed photo-count limits.
 - Photos must be readable by TJpg_Decoder; not every JPEG encoding is supported.
 - This is a development firmware: HTTPS certificate verification is currently disabled, and diagnostic logs can contain sensitive authentication/download information. Do not publish raw serial logs.
 - Photo sizes and SD capacity need to be managed by the user; do not rely on automatic storage-budget enforcement.

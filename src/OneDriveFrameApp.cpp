@@ -244,6 +244,7 @@ void OneDriveFrameApp::runSyncStep() {
       Serial.println("[Graph] Starting background photo download pass.");
       if (graphClient_.downloadNewestPhotos(token_)) {
         Serial.println("[Graph] Download pass completed successfully.");
+        state_ = AppState::kPruneOldPhotos;
       } else {
         Serial.println("[Graph] Download pass did not complete successfully.");
         if (graphClient_.consumeAuthFailure()) {
@@ -253,9 +254,9 @@ void OneDriveFrameApp::runSyncStep() {
           state_ = AppState::kRefreshOrLogin;
           break;
         }
+        state_ = AppState::kDisplaySlideshow;
       }
       lastSuccessfulSyncMs_ = millis();
-      state_ = AppState::kDisplaySlideshow;
       break;
 
     case AppState::kPruneOldPhotos:

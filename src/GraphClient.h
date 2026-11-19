@@ -21,20 +21,6 @@ class GraphClient {
   bool consumeAuthFailure();
 
  private:
-  struct PendingPhoto {
-    String itemId;
-    String name;
-    String modifiedUtc;
-    String etag;
-    String mimeType;
-    int32_t width = -1;
-    int32_t height = -1;
-    String orientation;
-    uint32_t sizeBytes = 0;
-  };
-
-  PendingPhoto pendingPhotos_[128];
-  size_t pendingPhotoCount_ = 0;
   PhotoCatalog* catalog_ = nullptr;
   bool authFailure_ = false;
   SemaphoreHandle_t storageMutex_ = nullptr;

@@ -94,8 +94,10 @@ START ──▶ WIFI_CONNECT ──▶ LOAD_TOKEN ──▶ CHECK_TOKEN_VALIDITY
               │                     ▼           │ other fail      ▼
               │             DOWNLOAD_NEW_PHOTOS │           IDLE_WAIT_FOR_SYNC
               │                     │ 401 ──────┼──▶ REFRESH_TOKEN_OR_LOGIN
-              │                     ▼           ▼
-              └──────────────  DISPLAY_SLIDESHOW
+              │                     ▼
+              │              PRUNE_OLD_PHOTOS
+              │                     ▼
+              └────────────── DISPLAY_SLIDESHOW
 ```
 
 - **START** – Open/create the catalog and reconcile it with files on SD (retries every second until it succeeds), then open the NVS token store.
@@ -103,11 +105,10 @@ START ──▶ WIFI_CONNECT ──▶ LOAD_TOKEN ──▶ CHECK_TOKEN_VALIDITY
 - **LOAD_TOKEN / CHECK_TOKEN_VALIDITY** – Tokens are restored from NVS, but expiry is not trusted across reboots (`expiresAtMs = 0`), so the first sync after boot always refreshes.
 - **REFRESH_TOKEN_OR_LOGIN** – Try refresh-token grant; if that fails, run the device-code flow. Save tokens on success.
 - **LIST_ONEDRIVE_FOLDER** – See 6.3. A 401 clears the access token and goes back to refresh/login.
-- **DOWNLOAD_NEW_PHOTOS** – See 6.4. Sets `lastSuccessfulSyncMs_` whether or not every file succeeded.
+- **DOWNLOAD_NEW_PHOTOS** – See 6.4. On success, continue to pruning; on failure, keep local photos and return to display without pruning.
+- **PRUNE_OLD_PHOTOS** – Remove downloaded OneDrive photos that were not present in the completed listing, then enforce the 4 GiB quota.
 - **DISPLAY_SLIDESHOW** – Marker state only (the display task runs independently); moves to idle.
 - **IDLE_WAIT_FOR_SYNC** – Re-enters WIFI_CONNECT once `kSyncIntervalMs` (3 h) has passed since the last completed download pass.
-
-`PRUNE_OLD_PHOTOS` exists but is **not reachable** from any transition today (see section 13).
 
 ### 6.2 Authentication
 
@@ -127,18 +128,18 @@ GET /v1.0/me/drive/root:/ESP32Frame:/children
 ```
 
 - Follows `@odata.nextLink` until exhausted (25 items per page keeps each JSON response small for the ESP32's limited internal RAM).
-- `beginRemoteSync()` first clears `remote_present` on all catalog rows that have an `item_id`.
+- `beginRemoteSync()` first clears `remote_present` on all catalog rows that have an `item_id`. Pruning is only entered after the complete listing and download pass succeed.
 - For each child that is a file with a `.jpg`, `.jpeg`, or `.png` name, a non-empty `id`, and a `lastModifiedDateTime`:
   - The catalog row is upserted (matched by `item_id`, else by `local_path`, else inserted) with `remote_present = 1`.
-  - The item is appended to an in-memory download queue of **128** entries. Once full, further items are still cataloged but not queued for this pass.
-- The queue is then sorted by `lastModifiedDateTime` descending (newest first).
+  - All matching rows remain in SQLite; there is no in-memory queue or per-sync file cap.
 - Local filenames are the OneDrive names with `/ \ : * ? " < > |` replaced by `_`.
-- `getWithBearer` retries transport failures up to 6 attempts and honours `Retry-After` on HTTP 429 (exponential back-off when the header is absent). Response bodies are truncated at the first NUL byte before JSON parsing.
-- Listing returns failure if no images were queued; the state machine then skips downloads for this cycle.
+- Folder pagination reuses one HTTP/1.1 TLS connection across all `@odata.nextLink` pages. This avoids allocating a fresh TLS context after a large Graph page has fragmented internal RAM.
+- `getWithBearer` retries transport failures up to 6 attempts and honours `Retry-After` on HTTP 429 (exponential back-off when the header is absent). It logs the TLS error, URL length, and internal-heap state without logging the bearer token. Response bodies are truncated at the first NUL byte before JSON parsing.
+- Listing returns failure if the completed folder has no matching images; the state machine then skips downloads and pruning for this cycle.
 
 ### 6.4 Downloads
 
-For each queued photo, newest first:
+Downloads select catalog rows 16 at a time, ordered by `last_modified_utc` descending. A `(modifiedUtc, rowId)` cursor advances between batches, so the only fixed list is the current 16-photo working batch:
 
 1. **Skip check** – If `/photos/<name>` exists, its size equals the Graph `size`, and (for JPEGs) it ends with the `FF D9` end-of-image marker, skip it. Otherwise delete it and any stale `.part` file.
 2. **Resolve URL** – `GET /me/drive/items/{id}?select=id,name,@microsoft.graph.downloadUrl`.
@@ -173,11 +174,11 @@ SQLite database at `/sd/catalog.db`, table `photos`:
 | `local_present` | File currently on SD |
 | `downloaded_utc` | When the file was last saved |
 
-Indexes exist on `item_id`, `last_modified_utc`, `local_present`, and `size_bytes`. Older databases are migrated in place when `remote_present` is missing. The app owns one persistent connection shared by Graph and storage; its prepared statements cover reconciliation, remote upserts, and downloaded-file state. `execute()` retries `SQLITE_IOERR` and `SQLITE_BUSY` up to 3 times.
+Indexes exist on `item_id`, `last_modified_utc`, `local_present`, and `size_bytes`. Older databases are migrated in place when `remote_present` is missing. The app owns one persistent connection shared by Graph and storage; its prepared statements cover reconciliation, remote upserts, and downloaded-file state. `execute()` retries `SQLITE_IOERR` and `SQLITE_BUSY` up to 3 times. On `SQLITE_IOERR`, it closes and reopens the database, re-prepares statements, and retries, because an SD/FATFS handle may remain unusable after `EIO`.
 
 `reconcileWithStorage()` (run at START) marks every row `local_present = 0`, then walks `/photos` and marks or inserts each file found.
 
-The shared-connection foundation is complete; the in-memory 128-photo download queue and 256-photo slideshow list remain active until later steps. Queue-state fields and sync-version migrations will be designed with the download step, because this embedded SQLite build cannot safely alter the existing table through a large schema migration.
+The catalog is now the index for both download and slideshow selection. No schema-extension migration is required for this implementation.
 
 ## 7. Display pipeline
 
@@ -201,9 +202,9 @@ The larger bounce buffer and slightly lower pixel clock give the LCD's bounce-bu
 Each display-task step:
 
 1. Run LVGL timers.
-2. If the current slide has been shown for less than `kSlideDurationMs` (8 s), return.
-3. Rescan `/photos` for `.jpg` / `.jpeg` files (up to 256), sorted by path. The very first scan header-probes files and stops at the first readable one; later scans skip probing for speed and yield every 16 entries.
-4. Render the next file in round-robin order.
+2. If the current slide has been shown for less than `kSlideDurationMs` (10 s), return.
+3. Query the catalog for the next `local_present` `.jpg` / `.jpeg` path after the current path, wrapping to the beginning when necessary. Before the catalog is initialized at boot, perform a one-time directory scan for the first readable JPEG.
+4. Render the selected file.
 5. Start the hold timer **after** rendering completes, so slow decodes don't shorten the visible time. Failed renders also wait one interval.
 
 A slide log line records scan time, render time, and file count.
@@ -224,7 +225,7 @@ A slide log line records scan time, render time, and file count.
 
 ## 8. Concurrency and memory notes
 
-- **Internal RAM is the scarcest resource.** TLS sessions need a large contiguous internal block (~31 KB largest block observed). Download buffers, LVGL buffers, decoded images, and the frame buffer all live in PSRAM.
+- **Internal RAM is the scarcest resource.** TLS sessions need a large contiguous internal block (~31 KB largest block observed). SQLite uses a small 256 KiB cache and file-backed temporary storage, while download buffers, LVGL buffers, decoded images, and the frame buffer live in PSRAM.
 - The panel ISR copies from PSRAM continuously; heavy PSRAM traffic from other work can starve it. Avoid large `memmove`s in PSRAM on hot paths (the download history buffer is a ring buffer for this reason).
 - A full display-side scan that probed every JPEG header previously tripped the task watchdog; header probing is now limited to the first boot scan.
 
@@ -260,14 +261,12 @@ From [FrameConfig.h](../src/FrameConfig.h):
 | `kSdSpiFrequencyHz` | 4 MHz | SD SPI clock |
 | `kSdFormatIfEmpty` | `true` | **Formats the card** if the normal mount fails |
 | `kSyncIntervalMs` | 3 h | Time between sync passes |
-| `kSlideDurationMs` | 8 s | Time each photo is held |
+| `kSlideDurationMs` | 10 s | Time each photo is held |
 | `kDisplayBounceBufferLines` | 16 | RGB bounce buffer height (must divide 240 evenly when × 800) |
 | `kDisplayPixelClockHz` | 13 MHz | RGB pixel clock |
 | `kEnableDisplayOutput` | `true` | Disable to run without rendering |
-| `kMaxLocalUsageBytes` | 4 GiB¹ | Quota used by the (currently unreachable) prune step |
+| `kMaxLocalUsageBytes` | 4 GiB | Quota enforced after a successful download pass |
 | `kDefaultDeviceCodePollMs` | 5 s | Poll interval if the server omits one |
-
-¹ Declared as `uint32_t`, so `4 * 1024³` overflows to 0. This needs fixing before pruning is enabled.
 
 ## 11. Build and tooling
 
@@ -287,10 +286,8 @@ Log prefixes: `[Boot]`, `[Storage]`, `[Catalog]`, `[Display]`, `[LVGL]`, `[WiFi]
 
 ## 13. Known gaps and future work
 
-- **Pruning is not wired up.** `PhotoStorage::pruneOldestPhotos()` and the catalog queries (`removeFilesNotInRemoteCatalog`, `pruneOldestLocalFilesToQuota`) are implemented, but no state transition reaches `PRUNE_OLD_PHOTOS`. Photos removed from OneDrive stay on SD, and no quota is enforced. Enabling this also requires fixing the `kMaxLocalUsageBytes` overflow.
-- **Queue selection order.** The 128-item queue fills in Graph listing order and is sorted afterwards, so with more than 128 images it is not guaranteed to hold the newest 128.
 - **PNG** files are downloaded and cataloged, but the slideshow only renders JPEG.
-- **Slideshow cap.** Only the first 256 JPEGs found in `/photos` are shown, in filename order.
+- **Change detection is size/content based.** Existing files are skipped when their size and JPEG end marker are valid; the stored etag is not yet used to detect same-size edits.
 - **First-scan deletion.** An unreadable JPEG found by the first boot scan is deleted rather than skipped.
 - **EXIF orientation** is stored in the catalog but not applied when rendering.
 - **Sign-in UX.** The device code is printed to serial only, not shown on the display.

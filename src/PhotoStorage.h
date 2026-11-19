@@ -17,18 +17,16 @@ class PhotoStorage {
   void displaySlideshow();
 
  private:
-  bool refreshPhotoList(bool firstPhotoOnly = false);
+  bool findFirstPhoto(String& path);
   bool showPhoto(const String& path);
   bool decodeJpegToRgb565(const String& sourcePath, uint16_t targetW, uint16_t targetH,
                           std::unique_ptr<uint16_t[]>& pixels, uint16_t& outW, uint16_t& outH);
 
-  static constexpr size_t kMaxPhotoFiles = 256;
   bool isMounted_ = false;
+  bool catalogReady_ = false;
   bool displayInitialized_ = false;
-  size_t photoFileCount_ = 0;
-  size_t slideshowIndex_ = 0;
   uint32_t lastSlideAtMs_ = 0;
-  String photoFiles_[kMaxPhotoFiles];
+  String currentPhotoPath_;
   PhotoCatalog* catalog_ = nullptr;
 };
 

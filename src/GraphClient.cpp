@@ -222,9 +222,15 @@ uint32_t parseRetryAfterSeconds(HTTPClient& http) {
   return 0U;
 }
 
-bool getWithBearer(const String& url, const String& token, int& statusCode, String& responseBody) {
+bool getWithBearer(const String& url, const String& token, int& statusCode, String& responseBody,
+                   WiFiClientSecure* sessionClient = nullptr, HTTPClient* sessionHttp = nullptr) {
   const uint32_t kBaseRetryDelayMs = 2000UL;
   const uint8_t kMaxRetries = 5U;
+  WiFiClientSecure standaloneClient;
+  HTTPClient standaloneHttp;
+  WiFiClientSecure& client = sessionClient != nullptr ? *sessionClient : standaloneClient;
+  HTTPClient& http = sessionHttp != nullptr ? *sessionHttp : standaloneHttp;
+  const bool keepAlive = sessionClient != nullptr && sessionHttp != nullptr;
 
   for (uint8_t attempt = 0; attempt <= kMaxRetries; ++attempt) {
     if (WiFi.status() != WL_CONNECTED) {
@@ -239,11 +245,9 @@ bool getWithBearer(const String& url, const String& token, int& statusCode, Stri
       }
     }
 
-    WiFiClientSecure client;
     client.setInsecure();
     client.setTimeout(15000);
 
-    HTTPClient http;
     if (!http.begin(client, url)) {
       Serial.println("[Graph] Failed to initialize HTTPS client.");
       return false;
@@ -251,13 +255,17 @@ bool getWithBearer(const String& url, const String& token, int& statusCode, Stri
 
     http.setTimeout(15000);
     http.setConnectTimeout(10000);
-    http.setReuse(false);
-    http.useHTTP10(true);
-    http.addHeader("Connection", "close");
+    http.setReuse(keepAlive);
+    http.useHTTP10(!keepAlive);
+    http.addHeader("Connection", keepAlive ? "keep-alive" : "close");
     http.addHeader("Authorization", "Bearer " + token);
     http.addHeader("Accept", "application/json");
 
     statusCode = http.GET();
+    char networkError[96] = {};
+    if (statusCode <= 0) {
+      client.lastError(networkError, sizeof(networkError));
+    }
     responseBody = http.getString();
     trimAtFirstNul(responseBody);
     const uint32_t retryAfterMs = parseRetryAfterSeconds(http);
@@ -270,8 +278,11 @@ bool getWithBearer(const String& url, const String& token, int& statusCode, Stri
       Serial.print(attempt + 1);
       Serial.print("/");
       Serial.print(kMaxRetries + 1);
-      Serial.printf(") internalFree=%u largest=%u\n", static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-                    static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+      Serial.printf(") internalFree=%u largest=%u tlsError=%s urlLength=%u\n",
+                    static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                    static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+                    networkError,
+                    static_cast<unsigned>(url.length()));
       if (attempt < kMaxRetries) {
         delay(1500UL * (attempt + 1));
         continue;
@@ -364,7 +375,6 @@ bool fetchDownloadUrlForItem(const String& itemId, const String& accessToken, St
 
 bool GraphClient::listFolder(const OAuthToken& token) {
   authFailure_ = false;
-  pendingPhotoCount_ = 0;
   if (token.accessToken.isEmpty()) {
     Serial.println("[Graph] Missing access token.");
     return false;
@@ -394,12 +404,13 @@ bool GraphClient::listFolder(const OAuthToken& token) {
   size_t totalFiles = 0;
   size_t totalImages = 0;
   size_t cataloged = 0;
-  bool queueLimitReached = false;
+  WiFiClientSecure pageClient;
+  HTTPClient pageHttp;
 
   while (!endpoint.isEmpty()) {
     int statusCode = 0;
     String responseBody;
-    if (!getWithBearer(endpoint, token.accessToken, statusCode, responseBody)) {
+    if (!getWithBearer(endpoint, token.accessToken, statusCode, responseBody, &pageClient, &pageHttp)) {
       Serial.println("[Graph] Folder request transport failure.");
       return false;
     }
@@ -481,21 +492,6 @@ bool GraphClient::listFolder(const OAuthToken& token) {
         break;
       }
 
-      if (pendingPhotoCount_ >= (sizeof(pendingPhotos_) / sizeof(pendingPhotos_[0]))) {
-        queueLimitReached = true;
-        continue;
-      }
-
-      pendingPhotos_[pendingPhotoCount_].itemId = itemId;
-      pendingPhotos_[pendingPhotoCount_].name = name;
-      pendingPhotos_[pendingPhotoCount_].modifiedUtc = modified;
-      pendingPhotos_[pendingPhotoCount_].etag = etag;
-      pendingPhotos_[pendingPhotoCount_].mimeType = mimeType;
-      pendingPhotos_[pendingPhotoCount_].width = width;
-      pendingPhotos_[pendingPhotoCount_].height = height;
-      pendingPhotos_[pendingPhotoCount_].orientation = orientation;
-      pendingPhotos_[pendingPhotoCount_].sizeBytes = sizeBytes;
-      ++pendingPhotoCount_;
     }
 
     if (!pageOk || !catalog_->commitTransaction()) {
@@ -506,16 +502,6 @@ bool GraphClient::listFolder(const OAuthToken& token) {
     endpoint = doc["@odata.nextLink"] | "";
   }
 
-  for (size_t i = 1; i < pendingPhotoCount_; ++i) {
-    PendingPhoto key = pendingPhotos_[i];
-    size_t j = i;
-    while (j > 0 && pendingPhotos_[j - 1].modifiedUtc < key.modifiedUtc) {
-      pendingPhotos_[j] = pendingPhotos_[j - 1];
-      --j;
-    }
-    pendingPhotos_[j] = key;
-  }
-
   Serial.print("[Graph] Folder children/files/images: ");
   Serial.print(totalChildren);
   Serial.print("/");
@@ -524,14 +510,9 @@ bool GraphClient::listFolder(const OAuthToken& token) {
   Serial.println(totalImages);
   Serial.print("[Graph] Cataloged image metadata rows: ");
   Serial.println(cataloged);
-  Serial.print("[Graph] Queued image files: ");
-  Serial.println(pendingPhotoCount_);
-  if (queueLimitReached) {
-    Serial.print("[Graph] Queue limit reached; only the first ");
-    Serial.print(sizeof(pendingPhotos_) / sizeof(pendingPhotos_[0]));
-    Serial.println(" images will be downloaded this sync pass.");
-  }
-  return pendingPhotoCount_ > 0;
+  Serial.print("[Graph] Remote image rows ready for catalog download batches: ");
+  Serial.println(totalImages);
+  return totalImages > 0;
 }
 
 bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
@@ -541,23 +522,39 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     return false;
   }
 
-  if (pendingPhotoCount_ == 0) {
-    Serial.println("[Graph] No queued photos to download.");
-    return true;
-  }
-
-  Serial.println("[Graph] Downloading queued OneDrive folder photos.");
-  Serial.print("[Graph] Download queue size: ");
-  Serial.println(pendingPhotoCount_);
-
+  Serial.println("[Graph] Downloading OneDrive photos from catalog in newest-first batches.");
+  constexpr size_t kDownloadBatchSize = 16;
+  PhotoCatalog::DownloadPhoto photos[kDownloadBatchSize];
   size_t successCount = 0;
-  for (size_t i = 0; i < pendingPhotoCount_; ++i) {
-    const PendingPhoto& photo = pendingPhotos_[i];
-    const String filePath = String(kPhotoDirectory) + "/" + sanitizeFilename(photo.name);
+  size_t processedCount = 0;
+  String afterModifiedUtc;
+  int64_t afterRowId = 0;
+
+  for (;;) {
+    size_t batchCount = 0;
+    {
+      StorageLock lock(storageMutex_);
+      if (catalog_ == nullptr) {
+        Serial.println("[Graph] Catalog unavailable for download.");
+        return false;
+      }
+      if (!catalog_->loadDownloadBatch(afterModifiedUtc, afterRowId, photos, kDownloadBatchSize, batchCount)) {
+        Serial.println("[Graph] Failed to read catalog download batch.");
+        return false;
+      }
+    }
+    if (batchCount == 0) {
+      break;
+    }
+
+  for (size_t i = 0; i < batchCount; ++i) {
+    const PhotoCatalog::DownloadPhoto& photo = photos[i];
+    ++processedCount;
+    const String filePath = String(kPhotoDirectory) + "/" + sanitizeFilename(photo.filename);
     const String tempFilePath = filePath + ".part";
 
     Serial.print("[Graph] Preparing to download: ");
-    Serial.print(photo.name);
+    Serial.print(photo.filename);
     Serial.print(" (id=");
     Serial.print(photo.itemId);
     Serial.print(", size=");
@@ -569,16 +566,16 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
       if (SD.exists(filePath)) {
         File existing = SD.open(filePath, FILE_READ);
         const bool sizeMatches = existing && existing.size() == photo.sizeBytes;
-        const bool contentOk = sizeMatches && (!isJpegName(photo.name) || endsWithJpegEoi(existing));
+        const bool contentOk = sizeMatches && (!isJpegName(photo.filename) || endsWithJpegEoi(existing));
         if (existing) {
           existing.close();
         }
         if (contentOk) {
-          Serial.println("[Graph] Skipping unchanged file: " + photo.name);
+          Serial.println("[Graph] Skipping unchanged file: " + photo.filename);
           ++successCount;
           continue;
         }
-        Serial.println("[Graph] Local copy missing/incomplete; re-downloading: " + photo.name);
+        Serial.println("[Graph] Local copy missing/incomplete; re-downloading: " + photo.filename);
         SD.remove(filePath);
       }
       if (SD.exists(tempFilePath)) {
@@ -588,12 +585,12 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
 
     String effectiveUrl;
     if (!fetchDownloadUrlForItem(photo.itemId, token.accessToken, effectiveUrl)) {
-      Serial.println("[Graph] Could not resolve download URL for item: " + photo.name);
+      Serial.println("[Graph] Could not resolve download URL for item: " + photo.filename);
       continue;
     }
 
     Serial.print("[Graph] Download URL resolved for ");
-    Serial.print(photo.name);
+    Serial.print(photo.filename);
     Serial.print(" -> ");
     Serial.println(effectiveUrl.substring(0, 120));
     Serial.print("[Graph] Source file target: ");
@@ -607,7 +604,7 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     client.setInsecure();
     HTTPClient http;
     if (!http.begin(client, effectiveUrl)) {
-      Serial.println("[Graph] Failed to start download request for: " + photo.name);
+      Serial.println("[Graph] Failed to start download request for: " + photo.filename);
       continue;
     }
 
@@ -625,7 +622,7 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     if (statusCode != 200) {
       const String errorBody = http.getString();
       Serial.print("[Graph] Download failed for ");
-      Serial.print(photo.name);
+      Serial.print(photo.filename);
       Serial.print(" with HTTP ");
       Serial.println(statusCode);
       Serial.print("[Graph] Download URL: ");
@@ -778,7 +775,7 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     const size_t expected = photo.sizeBytes > 0 ? photo.sizeBytes
                                                 : (contentLength > 0 ? static_cast<size_t>(contentLength) : 0);
     Serial.print("[Graph] Download result for ");
-    Serial.print(photo.name);
+    Serial.print(photo.filename);
     Serial.print(": exit=");
     Serial.print(exitReason);
     Serial.print(" expected=");
@@ -796,7 +793,7 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     if (contentLength > 0 && static_cast<size_t>(contentLength) != expected) {
       valid = false;
     }
-    if (valid && isJpegName(photo.name)) {
+    if (valid && isJpegName(photo.filename)) {
       StorageLock lock(storageMutex_);
       File check = SD.open(tempFilePath, FILE_READ);
       valid = check && endsWithJpegEoi(check);
@@ -809,7 +806,7 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     }
 
     if (!valid) {
-      Serial.println("[Graph] Incomplete download discarded: " + photo.name);
+      Serial.println("[Graph] Incomplete download discarded: " + photo.filename);
       StorageLock lock(storageMutex_);
       SD.remove(tempFilePath);
       continue;
@@ -823,18 +820,18 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
         continue;
       }
       if (!SD.rename(tempFilePath, filePath)) {
-        Serial.println("[Graph] Failed to rename temp file into place: " + photo.name);
+        Serial.println("[Graph] Failed to rename temp file into place: " + photo.filename);
         SD.remove(tempFilePath);
         continue;
       }
       if (catalog_ == nullptr ||
-          !catalog_->markDownloaded(photo.itemId, photo.name, filePath, static_cast<uint32_t>(written))) {
-        Serial.println("[Graph] Failed to mark download in catalog: " + photo.name);
+          !catalog_->markDownloaded(photo.itemId, photo.filename, filePath, static_cast<uint32_t>(written))) {
+        Serial.println("[Graph] Failed to mark download in catalog: " + photo.filename);
       }
     }
 
     Serial.print("[Graph] Saved ");
-    Serial.print(photo.name);
+    Serial.print(photo.filename);
     Serial.print(" (");
     Serial.print(written);
     Serial.println(" bytes)");
@@ -843,14 +840,17 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
     Serial.print("[Graph] Download progress: ");
     Serial.print(successCount);
     Serial.print("/");
-    Serial.println(pendingPhotoCount_);
+    Serial.println(processedCount);
+  }
+    afterModifiedUtc = photos[batchCount - 1].modifiedUtc;
+    afterRowId = photos[batchCount - 1].rowId;
   }
 
   Serial.print("[Graph] Downloaded files this sync: ");
   Serial.print(successCount);
   Serial.print("/");
-  Serial.println(pendingPhotoCount_);
-  return successCount > 0;
+  Serial.println(processedCount);
+  return successCount > 0 || processedCount == 0;
 }
 
 bool GraphClient::refreshAccessToken(OAuthToken& token) {

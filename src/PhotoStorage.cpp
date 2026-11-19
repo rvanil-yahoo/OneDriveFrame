@@ -376,6 +376,7 @@ bool PhotoStorage::initializeCatalog() {
     return false;
   }
 
+  catalogReady_ = true;
   return true;
 }
 
@@ -426,8 +427,8 @@ bool PhotoStorage::pruneOldestPhotos() {
   return currentUsageBytes() <= kMaxLocalUsageBytes;
 }
 
-bool PhotoStorage::refreshPhotoList(bool firstPhotoOnly) {
-  photoFileCount_ = 0;
+bool PhotoStorage::findFirstPhoto(String& path) {
+  path = "";
   File root = SD.open(kPhotoDirectory);
   if (!root || !root.isDirectory()) {
     if (root) {
@@ -443,59 +444,41 @@ bool PhotoStorage::refreshPhotoList(bool firstPhotoOnly) {
       vTaskDelay(1);
     }
     if (!entry.isDirectory()) {
-      String path = String(entry.path());
-      if (!isJpegFile(path)) {
+      String candidatePath = String(entry.path());
+      if (!isJpegFile(candidatePath)) {
         entry.close();
         entry = root.openNextFile();
         continue;
       }
 
-      // Header probing every file is too slow for large libraries; full scans defer validation to render time.
       uint16_t testW = 0;
       uint16_t testH = 0;
-      const JRESULT sizeResult =
-          firstPhotoOnly ? TJpgDec.getSdJpgSize(&testW, &testH, path.c_str()) : JDR_OK;
+      const JRESULT sizeResult = TJpgDec.getSdJpgSize(&testW, &testH, candidatePath.c_str());
       if (sizeResult != JDR_OK) {
         Serial.print("[Display] Skipping unreadable JPEG file: ");
-        Serial.print(path);
+        Serial.print(candidatePath);
         Serial.print(" (JRESULT=");
         Serial.print(static_cast<int>(sizeResult));
         Serial.print(", size=");
         Serial.print(entry.size());
         Serial.println(" bytes)");
-        SD.remove(path);
+        SD.remove(candidatePath);
         entry.close();
         entry = root.openNextFile();
         continue;
       }
 
-      if (photoFileCount_ < kMaxPhotoFiles) {
-        photoFiles_[photoFileCount_++] = path;
-        if (firstPhotoOnly) {
-          entry.close();
-          break;
-        }
-      }
+      path = candidatePath;
+      entry.close();
+      root.close();
+      return true;
     }
     entry.close();
     entry = root.openNextFile();
   }
   root.close();
 
-  for (size_t i = 1; i < photoFileCount_; ++i) {
-    String key = photoFiles_[i];
-    size_t j = i;
-    while (j > 0 && photoFiles_[j - 1] > key) {
-      photoFiles_[j] = photoFiles_[j - 1];
-      --j;
-    }
-    photoFiles_[j] = key;
-  }
-
-  if (slideshowIndex_ >= photoFileCount_) {
-    slideshowIndex_ = 0;
-  }
-  return true;
+  return false;
 }
 
 bool PhotoStorage::decodeJpegToRgb565(const String& sourcePath, uint16_t targetW, uint16_t targetH,
@@ -735,7 +718,16 @@ void PhotoStorage::displaySlideshow() {
     return;
   }
 
-  if (!refreshPhotoList(lastSlideAtMs_ == 0) || photoFileCount_ == 0) {
+  String path;
+  size_t photoFileCount = 0;
+  bool selected = false;
+  if (catalogReady_ && catalog_ != nullptr && catalog_->nextSlideshowPhoto(currentPhotoPath_, path, photoFileCount)) {
+    selected = !path.isEmpty();
+  } else if (currentPhotoPath_.isEmpty()) {
+    selected = findFirstPhoto(path);
+    photoFileCount = selected ? 1 : 0;
+  }
+  if (!selected) {
     static uint32_t lastNoPhotoLogMs = 0;
     if (lastNoPhotoLogMs == 0 || now - lastNoPhotoLogMs > 10000UL) {
       Serial.println("[Display] No JPEG photos available for slideshow.");
@@ -744,14 +736,13 @@ void PhotoStorage::displaySlideshow() {
     return;
   }
 
-  const String path = photoFiles_[slideshowIndex_];
-  slideshowIndex_ = (slideshowIndex_ + 1) % photoFileCount_;
+  currentPhotoPath_ = path;
   const uint32_t scanDoneMs = millis();
   if (showPhoto(path)) {
     lastSlideAtMs_ = millis();
     Serial.printf("[Display] Slide committed at %lu ms (%u files): scan %lu ms, render %lu ms; holding for %lu ms.\n",
                   static_cast<unsigned long>(lastSlideAtMs_),
-                  static_cast<unsigned>(photoFileCount_),
+                  static_cast<unsigned>(photoFileCount),
                   static_cast<unsigned long>(scanDoneMs - now),
                   static_cast<unsigned long>(lastSlideAtMs_ - scanDoneMs),
                   static_cast<unsigned long>(kSlideDurationMs));

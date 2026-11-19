@@ -13,7 +13,6 @@ namespace odf {
 namespace {
 
 constexpr const char* kCatalogPath = "/sd/catalog.db";
-
 void resetStatement(sqlite3_stmt* statement) {
   if (statement != nullptr) {
     sqlite3_reset(statement);
@@ -77,7 +76,7 @@ bool PhotoCatalog::openDatabase() {
     return false;
   }
   sqlite3_busy_timeout(database_, 1000);
-  if (!execute("PRAGMA synchronous=NORMAL;PRAGMA temp_store=MEMORY;PRAGMA cache_size=-4096;")) {
+  if (!execute("PRAGMA synchronous=NORMAL;PRAGMA temp_store=FILE;PRAGMA cache_size=-256;")) {
     closeDatabase();
     return false;
   }
@@ -102,6 +101,17 @@ void PhotoCatalog::end() {
   initialized_ = false;
 }
 
+bool PhotoCatalog::recoverFromIoError(int rc) {
+  if ((rc & 0xFF) != SQLITE_IOERR || !initialized_) {
+    return false;
+  }
+  Serial.println("[Catalog] Reopening database connection after SD I/O error.");
+  closeDatabase();
+  initialized_ = false;
+  delay(250);
+  return begin();
+}
+
 bool PhotoCatalog::execute(const char* sql) {
   constexpr int kMaxAttempts = 3;
   if (database_ == nullptr) {
@@ -119,6 +129,9 @@ bool PhotoCatalog::execute(const char* sql) {
     Serial.print(errorMessage != nullptr ? errorMessage : sqlite3_errstr(rc));
     sqlite3_free(errorMessage);
     Serial.printf(" (attempt %d/%d)\n", attempt, kMaxAttempts);
+    if ((rc & 0xFF) == SQLITE_IOERR && attempt < kMaxAttempts && recoverFromIoError(rc)) {
+      continue;
+    }
     if (((rc & 0xFF) != SQLITE_IOERR && rc != SQLITE_BUSY) || attempt >= kMaxAttempts) {
       return false;
     }
@@ -461,6 +474,120 @@ bool PhotoCatalog::upsertRemotePhoto(const RemotePhotoMetadata& metadata) {
   return true;
 }
 
+bool PhotoCatalog::loadDownloadBatch(const String& afterModifiedUtc, int64_t afterRowId,
+                                     DownloadPhoto* photos, size_t capacity, size_t& count) {
+  count = 0;
+  if (photos == nullptr || capacity == 0 || (!initialized_ && !begin())) {
+    return false;
+  }
+
+  const bool firstBatch = afterModifiedUtc.isEmpty();
+  const char* sql = firstBatch
+      ? "SELECT id, item_id, filename, last_modified_utc, etag, size_bytes FROM photos "
+        "WHERE remote_present=1 AND item_id IS NOT NULL "
+        "ORDER BY COALESCE(last_modified_utc,'') DESC, id ASC LIMIT ?1;"
+      : "SELECT id, item_id, filename, last_modified_utc, etag, size_bytes FROM photos "
+        "WHERE remote_present=1 AND item_id IS NOT NULL "
+        "AND (COALESCE(last_modified_utc,'') < ?1 OR "
+        "(COALESCE(last_modified_utc,'') = ?1 AND id > ?2)) "
+        "ORDER BY COALESCE(last_modified_utc,'') DESC, id ASC LIMIT ?3;";
+  sqlite3_stmt* stmt = nullptr;
+  const int prepareRc = sqlite3_prepare_v2(database_, sql, -1, &stmt, nullptr);
+  if (prepareRc != SQLITE_OK) {
+    logSqliteError("prepare download batch", database_, prepareRc);
+    return false;
+  }
+  if (firstBatch) {
+    sqlite3_bind_int64(stmt, 1, static_cast<int64_t>(capacity));
+  } else {
+    bindNullableText(stmt, 1, afterModifiedUtc);
+    sqlite3_bind_int64(stmt, 2, afterRowId);
+    sqlite3_bind_int64(stmt, 3, static_cast<int64_t>(capacity));
+  }
+
+  int rc = SQLITE_OK;
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW && count < capacity) {
+    DownloadPhoto& photo = photos[count++];
+    photo.rowId = sqlite3_column_int64(stmt, 0);
+    const char* itemId = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+    const char* filename = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+    const char* modifiedUtc = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+    const char* etag = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+    photo.itemId = itemId != nullptr ? itemId : "";
+    photo.filename = filename != nullptr ? filename : "";
+    photo.modifiedUtc = modifiedUtc != nullptr ? modifiedUtc : "";
+    photo.etag = etag != nullptr ? etag : "";
+    photo.sizeBytes = static_cast<uint32_t>(sqlite3_column_int64(stmt, 5));
+  }
+  sqlite3_finalize(stmt);
+  if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+    logSqliteError("read download batch", database_, rc);
+    return false;
+  }
+  return true;
+}
+
+bool PhotoCatalog::nextSlideshowPhoto(const String& afterPath, String& path, size_t& count) {
+  path = "";
+  count = 0;
+  if (!initialized_ && !begin()) {
+    return false;
+  }
+
+  sqlite3_stmt* countStmt = nullptr;
+  const char* countSql =
+      "SELECT COUNT(*) FROM photos WHERE local_present=1 "
+      "AND (lower(local_path) LIKE '%.jpg' OR lower(local_path) LIKE '%.jpeg');";
+  int rc = sqlite3_prepare_v2(database_, countSql, -1, &countStmt, nullptr);
+  if (rc != SQLITE_OK) {
+    logSqliteError("prepare slideshow count", database_, rc);
+    return false;
+  }
+  rc = sqlite3_step(countStmt);
+  if (rc == SQLITE_ROW) {
+    count = static_cast<size_t>(sqlite3_column_int64(countStmt, 0));
+  }
+  sqlite3_finalize(countStmt);
+  if (rc != SQLITE_ROW) {
+    logSqliteError("read slideshow count", database_, rc);
+    recoverFromIoError(rc);
+    return false;
+  }
+  if (count == 0) {
+    return true;
+  }
+
+  const char* nextSql =
+      "SELECT local_path FROM photos WHERE local_present=1 "
+      "AND (lower(local_path) LIKE '%.jpg' OR lower(local_path) LIKE '%.jpeg') "
+      "AND local_path > ?1 ORDER BY local_path ASC LIMIT 1;";
+  sqlite3_stmt* nextStmt = nullptr;
+  rc = sqlite3_prepare_v2(database_, nextSql, -1, &nextStmt, nullptr);
+  if (rc != SQLITE_OK) {
+    logSqliteError("prepare next slideshow photo", database_, rc);
+    return false;
+  }
+  bindNullableText(nextStmt, 1, afterPath);
+  rc = sqlite3_step(nextStmt);
+  if (rc == SQLITE_DONE) {
+    sqlite3_finalize(nextStmt);
+    const char* firstSql =
+        "SELECT local_path FROM photos WHERE local_present=1 "
+        "AND (lower(local_path) LIKE '%.jpg' OR lower(local_path) LIKE '%.jpeg') "
+        "ORDER BY local_path ASC LIMIT 1;";
+    rc = sqlite3_prepare_v2(database_, firstSql, -1, &nextStmt, nullptr);
+    if (rc == SQLITE_OK) {
+      rc = sqlite3_step(nextStmt);
+    }
+  }
+  if (rc == SQLITE_ROW) {
+    const char* localPath = reinterpret_cast<const char*>(sqlite3_column_text(nextStmt, 0));
+    path = localPath != nullptr ? localPath : "";
+  }
+  sqlite3_finalize(nextStmt);
+  return rc == SQLITE_ROW;
+}
+
 bool PhotoCatalog::stepMarkDownloaded(sqlite3_stmt* statement, const String& itemId, const String& filename,
                                       const String& localPath, uint32_t sizeBytes, bool matchItemId) {
   resetStatement(statement);
@@ -523,7 +650,7 @@ bool PhotoCatalog::removeFilesNotInRemoteCatalog(size_t& deletedCount, uint64_t&
   sqlite3_stmt* stmt = nullptr;
   const char* selectSql =
       "SELECT id, local_path, size_bytes, item_id FROM photos "
-      "WHERE local_present=1 AND (item_id IS NULL OR remote_present=0);";
+      "WHERE local_present=1 AND item_id IS NOT NULL AND remote_present=0;";
   int rc = sqlite3_prepare_v2(database_, selectSql, -1, &stmt, nullptr);
   if (rc != SQLITE_OK) {
     logSqliteError("prepare stale photo query", database_, rc);

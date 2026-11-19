@@ -30,7 +30,7 @@ constexpr uint32_t kSlideDurationMs = 10UL * 1000UL;
 constexpr uint32_t kDisplayBounceBufferLines = 16;
 constexpr uint32_t kDisplayPixelClockHz = 13UL * 1000UL * 1000UL;
 constexpr bool kEnableDisplayOutput = true;
-constexpr uint32_t kMaxLocalUsageBytes = 4UL * 1024UL * 1024UL * 1024UL;
+constexpr uint64_t kMaxLocalUsageBytes = 4ULL * 1024ULL * 1024ULL * 1024ULL;
 constexpr uint32_t kDefaultDeviceCodePollMs = 5000UL;
 
 #ifndef CLIENT_ID

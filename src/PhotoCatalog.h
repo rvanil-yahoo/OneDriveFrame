@@ -22,6 +22,15 @@ class PhotoCatalog {
     uint32_t sizeBytes = 0;
   };
 
+  struct DownloadPhoto {
+    String itemId;
+    String filename;
+    String modifiedUtc;
+    String etag;
+    uint32_t sizeBytes = 0;
+    int64_t rowId = 0;
+  };
+
   PhotoCatalog() = default;
   ~PhotoCatalog();
   PhotoCatalog(const PhotoCatalog&) = delete;
@@ -35,6 +44,9 @@ class PhotoCatalog {
   bool reconcileWithStorage();
   bool beginRemoteSync();
   bool upsertRemotePhoto(const RemotePhotoMetadata& metadata);
+  bool loadDownloadBatch(const String& afterModifiedUtc, int64_t afterRowId, DownloadPhoto* photos, size_t capacity,
+                         size_t& count);
+  bool nextSlideshowPhoto(const String& afterPath, String& path, size_t& count);
   bool markDownloaded(const String& itemId, const String& filename, const String& localPath, uint32_t sizeBytes);
   bool removeFilesNotInRemoteCatalog(size_t& deletedCount, uint64_t& freedBytes);
   bool pruneOldestLocalFilesToQuota(uint64_t quotaBytes, size_t& deletedCount, uint64_t& deletedBytes);
@@ -47,6 +59,7 @@ class PhotoCatalog {
   bool prepareStatements();
   void finalizeStatements();
   void closeDatabase();
+  bool recoverFromIoError(int rc);
   bool stepUpsertRemote(sqlite3_stmt* statement, const RemotePhotoMetadata& metadata, bool matchItemId);
   bool stepMarkDownloaded(sqlite3_stmt* statement, const String& itemId, const String& filename,
                           const String& localPath, uint32_t sizeBytes, bool matchItemId);
