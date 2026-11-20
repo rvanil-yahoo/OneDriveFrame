@@ -102,6 +102,7 @@ START ──▶ WIFI_CONNECT ──▶ LOAD_TOKEN ──▶ CHECK_TOKEN_VALIDITY
 
 - **START** – Open/create the catalog and reconcile it with files on SD (retries every second until it succeeds), then open the NVS token store.
 - **WIFI_CONNECT** – WiFiManager `autoConnect`; on failure go idle.
+- Wi‑Fi modem sleep is disabled after connection so PHY tracking timers are initialized before Graph/TLS activity and do not require late internal-RAM allocation.
 - **LOAD_TOKEN / CHECK_TOKEN_VALIDITY** – Tokens are restored from NVS, but expiry is not trusted across reboots (`expiresAtMs = 0`), so the first sync after boot always refreshes.
 - **REFRESH_TOKEN_OR_LOGIN** – Try refresh-token grant; if that fails, run the device-code flow. Save tokens on success.
 - **LIST_ONEDRIVE_FOLDER** – See 6.3. A 401 clears the access token and goes back to refresh/login.
@@ -202,10 +203,10 @@ The larger bounce buffer and slightly lower pixel clock give the LCD's bounce-bu
 Each display-task step:
 
 1. Run LVGL timers.
-2. If the current slide has been shown for less than `kSlideDurationMs` (10 s), return.
+2. Start the next decode early enough that its expected completion lands at the 10-second visible cadence. The delay subtracts the most recent scan/decode duration from `kSlideDurationMs`, so slow JPEG decoding is not added to the hold time.
 3. Query the catalog for the next `local_present` `.jpg` / `.jpeg` path after the current path, wrapping to the beginning when necessary. Before the catalog is initialized at boot, perform a one-time directory scan for the first readable JPEG.
 4. Render the selected file.
-5. Start the hold timer **after** rendering completes, so slow decodes don't shorten the visible time. Failed renders also wait one interval.
+5. Start the cadence timestamp after rendering completes. Decode time for the following slide happens while the current image remains visible.
 
 A slide log line records scan time, render time, and file count.
 

@@ -26,6 +26,8 @@ bool WifiSetupManager::connect() {
     return false;
   }
 
+  // Allocate/initiate PHY timers while internal RAM is least fragmented, before Graph TLS starts.
+  WiFi.setSleep(false);
   Serial.print("[WiFi] Connected. IP: ");
   Serial.println(WiFi.localIP());
   return true;

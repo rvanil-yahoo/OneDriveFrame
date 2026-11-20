@@ -282,6 +282,10 @@ void resizeRgb565Nearest(const uint16_t* src, uint16_t srcW, uint16_t srcH, uint
 
 }  // namespace
 
+void PsramPixelDeleter::operator()(uint16_t* pixels) const {
+  heap_caps_free(pixels);
+}
+
 bool PhotoStorage::begin() {
   if (isMounted_) {
     Serial.println("[Storage] SD already mounted.");
@@ -482,7 +486,7 @@ bool PhotoStorage::findFirstPhoto(String& path) {
 }
 
 bool PhotoStorage::decodeJpegToRgb565(const String& sourcePath, uint16_t targetW, uint16_t targetH,
-                                      std::unique_ptr<uint16_t[]>& pixels, uint16_t& outW, uint16_t& outH) {
+                                      PixelBuffer& pixels, uint16_t& outW, uint16_t& outH) {
   if (targetW == 0 || targetH == 0) {
     return false;
   }
@@ -513,7 +517,9 @@ bool PhotoStorage::decodeJpegToRgb565(const String& sourcePath, uint16_t targetW
   const uint16_t scaledW = scaledDimension(srcW, jpegScale);
   const uint16_t scaledH = scaledDimension(srcH, jpegScale);
 
-  pixels = std::make_unique<uint16_t[]>(static_cast<size_t>(scaledW) * scaledH);
+  pixels = PixelBuffer(static_cast<uint16_t*>(
+      heap_caps_malloc(static_cast<size_t>(scaledW) * scaledH * sizeof(uint16_t),
+                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)));
   if (pixels == nullptr || scaledW == 0 || scaledH == 0) {
     return false;
   }
@@ -577,7 +583,9 @@ bool PhotoStorage::decodeJpegToRgb565(const String& sourcePath, uint16_t targetW
     return true;
   }
 
-  std::unique_ptr<uint16_t[]> resized = std::make_unique<uint16_t[]>(static_cast<size_t>(targetW) * targetH);
+  PixelBuffer resized(static_cast<uint16_t*>(
+      heap_caps_malloc(static_cast<size_t>(targetW) * targetH * sizeof(uint16_t),
+                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)));
   if (resized == nullptr) {
     return false;
   }
@@ -589,9 +597,24 @@ bool PhotoStorage::decodeJpegToRgb565(const String& sourcePath, uint16_t targetW
   return true;
 }
 
-bool PhotoStorage::showPhoto(const String& path) {
+bool PhotoStorage::selectNextPhoto(String& path, size_t& photoCount) {
+  path = "";
+  photoCount = 0;
+  if (catalogReady_ && catalog_ != nullptr &&
+      catalog_->nextSlideshowPhoto(currentPhotoPath_, path, photoCount)) {
+    return !path.isEmpty();
+  }
+  if (currentPhotoPath_.isEmpty() || !catalogReady_) {
+    const bool found = findFirstPhoto(path);
+    photoCount = found ? 1 : 0;
+    return found;
+  }
+  return false;
+}
+
+bool PhotoStorage::preparePhoto(const String& path, PixelBuffer& pixels, uint16_t& width,
+                                uint16_t& height) {
   if (!kEnableDisplayOutput) {
-    Serial.println("[Display] Output disabled; slideshow selected: " + path);
     return true;
   }
 
@@ -612,26 +635,41 @@ bool PhotoStorage::showPhoto(const String& path) {
     return false;
   }
 
-  uint16_t readyW = static_cast<uint16_t>(frameWidth);
-  uint16_t readyH = static_cast<uint16_t>(frameHeight);
-  std::unique_ptr<uint16_t[]> readyPixels;
-  if (!decodeJpegToRgb565(path, readyW, readyH, readyPixels, readyW, readyH)) {
+  width = static_cast<uint16_t>(frameWidth);
+  height = static_cast<uint16_t>(frameHeight);
+  pixels.reset();
+  if (!decodeJpegToRgb565(path, width, height, pixels, width, height)) {
     Serial.print("[Display] Failed to decode image for display: ");
     Serial.println(path);
     return false;
   }
+  return true;
+}
 
+bool PhotoStorage::showPreparedPhoto(const String& path, const PixelBuffer& pixels, uint16_t width,
+                                     uint16_t height) {
+  if (!kEnableDisplayOutput) {
+    Serial.println("[Display] Output disabled; slideshow selected: " + path);
+    return true;
+  }
   Serial.print("[Display] Render ");
   Serial.print(path);
   Serial.print(" target=");
-  Serial.print(readyW);
+  Serial.print(width);
   Serial.print("x");
-  Serial.println(readyH);
-  if (!updateLvglImage(readyPixels.get(), readyW, readyH)) {
+  Serial.println(height);
+  if (!updateLvglImage(pixels.get(), width, height)) {
     return false;
   }
   Serial.println("[Display] Showing decoded image via LVGL image widget: " + path);
   return true;
+}
+
+bool PhotoStorage::showPhoto(const String& path) {
+  PixelBuffer pixels;
+  uint16_t width = 0;
+  uint16_t height = 0;
+  return preparePhoto(path, pixels, width, height) && showPreparedPhoto(path, pixels, width, height);
 }
 
 void PhotoStorage::displaySlideshow() {
@@ -714,19 +752,15 @@ void PhotoStorage::displaySlideshow() {
   }
 
   const uint32_t now = millis();
-  if (lastSlideAtMs_ != 0 && (now - lastSlideAtMs_) < kSlideDurationMs) {
+  const uint32_t minimumHoldMs =
+      lastPreparationMs_ < kSlideDurationMs ? kSlideDurationMs - lastPreparationMs_ : 0;
+  if (lastSlideAtMs_ != 0 && (now - lastSlideAtMs_) < minimumHoldMs) {
     return;
   }
 
   String path;
   size_t photoFileCount = 0;
-  bool selected = false;
-  if (catalogReady_ && catalog_ != nullptr && catalog_->nextSlideshowPhoto(currentPhotoPath_, path, photoFileCount)) {
-    selected = !path.isEmpty();
-  } else if (currentPhotoPath_.isEmpty()) {
-    selected = findFirstPhoto(path);
-    photoFileCount = selected ? 1 : 0;
-  }
+  const bool selected = selectNextPhoto(path, photoFileCount);
   if (!selected) {
     static uint32_t lastNoPhotoLogMs = 0;
     if (lastNoPhotoLogMs == 0 || now - lastNoPhotoLogMs > 10000UL) {
@@ -739,15 +773,18 @@ void PhotoStorage::displaySlideshow() {
   currentPhotoPath_ = path;
   const uint32_t scanDoneMs = millis();
   if (showPhoto(path)) {
-    lastSlideAtMs_ = millis();
-    Serial.printf("[Display] Slide committed at %lu ms (%u files): scan %lu ms, render %lu ms; holding for %lu ms.\n",
-                  static_cast<unsigned long>(lastSlideAtMs_),
+    const uint32_t slideCommittedMs = millis();
+    lastSlideAtMs_ = slideCommittedMs;
+    lastPreparationMs_ = slideCommittedMs - now;
+    Serial.printf("[Display] Slide committed at %lu ms (%u files): scan %lu ms, render %lu ms; target cadence %lu ms.\n",
+                  static_cast<unsigned long>(slideCommittedMs),
                   static_cast<unsigned>(photoFileCount),
                   static_cast<unsigned long>(scanDoneMs - now),
-                  static_cast<unsigned long>(lastSlideAtMs_ - scanDoneMs),
+                  static_cast<unsigned long>(slideCommittedMs - scanDoneMs),
                   static_cast<unsigned long>(kSlideDurationMs));
   } else {
     lastSlideAtMs_ = millis();
+    lastPreparationMs_ = 0;
     Serial.println("[Display] Render failed; waiting one slide interval before trying again.");
   }
 }
