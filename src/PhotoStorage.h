@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 #include <memory>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include "PhotoCatalog.h"
 
@@ -16,6 +18,8 @@ using PixelBuffer = std::unique_ptr<uint16_t[], PsramPixelDeleter>;
 class PhotoStorage {
  public:
   void setCatalog(PhotoCatalog* catalog) { catalog_ = catalog; }
+  void requestUserMessage(const String& title, const String& body, uint32_t timeoutMs);
+  void clearUserMessage();
   bool begin();
   bool initializeCatalog();
   uint64_t currentUsageBytes() const;
@@ -38,6 +42,11 @@ class PhotoStorage {
   uint32_t lastPreparationMs_ = 0;
   String currentPhotoPath_;
   PhotoCatalog* catalog_ = nullptr;
+  SemaphoreHandle_t promptMutex_ = nullptr;
+  bool userMessageActive_ = false;
+  String userMessageTitle_;
+  String userMessageBody_;
+  uint32_t userMessageDeadlineMs_ = 0;
 };
 
 }  // namespace odf

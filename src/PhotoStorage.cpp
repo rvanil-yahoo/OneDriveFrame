@@ -21,6 +21,13 @@ namespace {
 std::unique_ptr<esp_panel::board::Board> gDisplayBoard;
 esp_panel::drivers::LCD* gLcd = nullptr;
 lv_obj_t* gLvImage = nullptr;
+lv_obj_t* gLvMessageOverlay = nullptr;
+lv_obj_t* gLvMessageTitle = nullptr;
+lv_obj_t* gLvMessageBody = nullptr;
+lv_obj_t* gLvMessageCountdown = nullptr;
+String gLvMessageShownTitle;
+String gLvMessageShownBody;
+uint32_t gLvMessageShownCountdown = UINT32_MAX;
 lv_color_t* gLvImageBuffer = nullptr;
 lv_img_dsc_t gLvImageDescriptor = {};
 lv_color_t* gLvDisplayBuffer = nullptr;
@@ -262,6 +269,78 @@ bool updateLvglImage(const uint16_t* imagePixels, uint16_t imageW, uint16_t imag
   return true;
 }
 
+bool renderUserMessage(const String& title, const String& body, uint32_t remainingSeconds) {
+  if (!gLvglInitialized && !ensureLvglDisplay()) {
+    return false;
+  }
+  if (gLvMessageOverlay == nullptr) {
+    gLvMessageOverlay = lv_obj_create(lv_scr_act());
+    gLvMessageTitle = lv_label_create(gLvMessageOverlay);
+    gLvMessageBody = lv_label_create(gLvMessageOverlay);
+    gLvMessageCountdown = lv_label_create(gLvMessageOverlay);
+    if (gLvMessageOverlay == nullptr || gLvMessageTitle == nullptr || gLvMessageBody == nullptr ||
+        gLvMessageCountdown == nullptr) {
+      return false;
+    }
+    lv_obj_remove_style_all(gLvMessageOverlay);
+    lv_obj_set_size(gLvMessageOverlay, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(gLvMessageOverlay, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(gLvMessageOverlay, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(gLvMessageOverlay, 48, LV_PART_MAIN);
+    lv_obj_set_flex_flow(gLvMessageOverlay, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(gLvMessageOverlay, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(gLvMessageOverlay, 28, LV_PART_MAIN);
+
+    lv_obj_set_width(gLvMessageTitle, LV_PCT(92));
+    lv_obj_set_style_text_color(gLvMessageTitle, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(gLvMessageTitle, &lv_font_montserrat_28, LV_PART_MAIN);
+    lv_obj_set_style_text_align(gLvMessageTitle, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+
+    lv_obj_set_width(gLvMessageBody, LV_PCT(92));
+    lv_label_set_long_mode(gLvMessageBody, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(gLvMessageBody, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_align(gLvMessageBody, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+
+    lv_obj_set_width(gLvMessageCountdown, LV_PCT(92));
+    lv_obj_set_style_text_color(gLvMessageCountdown, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(gLvMessageCountdown, &lv_font_montserrat_28, LV_PART_MAIN);
+    lv_obj_set_style_text_align(gLvMessageCountdown, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  }
+
+  if (gLvMessageShownTitle == title && gLvMessageShownBody == body &&
+      gLvMessageShownCountdown == remainingSeconds) {
+    return true;
+  }
+  lv_label_set_text(gLvMessageTitle, title.c_str());
+  lv_label_set_text(gLvMessageBody, body.c_str());
+  char countdown[48];
+  snprintf(countdown, sizeof(countdown), "Slideshow resumes in %lu seconds",
+           static_cast<unsigned long>(remainingSeconds));
+  lv_label_set_text(gLvMessageCountdown, countdown);
+  lv_obj_move_foreground(gLvMessageOverlay);
+  lv_obj_invalidate(gLvMessageOverlay);
+  lv_refr_now(nullptr);
+  gLvMessageShownTitle = title;
+  gLvMessageShownBody = body;
+  gLvMessageShownCountdown = remainingSeconds;
+  return true;
+}
+
+void dismissUserMessageOverlay() {
+  if (gLvMessageOverlay != nullptr) {
+    lv_obj_del(gLvMessageOverlay);
+    gLvMessageOverlay = nullptr;
+    gLvMessageTitle = nullptr;
+    gLvMessageBody = nullptr;
+    gLvMessageCountdown = nullptr;
+    gLvMessageShownTitle = "";
+    gLvMessageShownBody = "";
+    gLvMessageShownCountdown = UINT32_MAX;
+    lv_obj_invalidate(lv_scr_act());
+    lv_refr_now(nullptr);
+  }
+}
+
 void resizeRgb565Nearest(const uint16_t* src, uint16_t srcW, uint16_t srcH, uint16_t dstW, uint16_t dstH, uint16_t* dst) {
   if (src == nullptr || dst == nullptr || srcW == 0 || srcH == 0 || dstW == 0 || dstH == 0) {
     return;
@@ -286,7 +365,38 @@ void PsramPixelDeleter::operator()(uint16_t* pixels) const {
   heap_caps_free(pixels);
 }
 
+void PhotoStorage::requestUserMessage(const String& title, const String& body, uint32_t timeoutMs) {
+  if (promptMutex_ == nullptr) {
+    promptMutex_ = xSemaphoreCreateMutex();
+  }
+  if (promptMutex_ == nullptr) {
+    return;
+  }
+  xSemaphoreTake(promptMutex_, portMAX_DELAY);
+  userMessageTitle_ = title;
+  userMessageBody_ = body;
+  userMessageDeadlineMs_ = millis() + timeoutMs;
+  userMessageActive_ = true;
+  xSemaphoreGive(promptMutex_);
+}
+
+void PhotoStorage::clearUserMessage() {
+  if (promptMutex_ == nullptr) {
+    return;
+  }
+  xSemaphoreTake(promptMutex_, portMAX_DELAY);
+  userMessageActive_ = false;
+  xSemaphoreGive(promptMutex_);
+}
+
 bool PhotoStorage::begin() {
+  if (promptMutex_ == nullptr) {
+    promptMutex_ = xSemaphoreCreateMutex();
+    if (promptMutex_ == nullptr) {
+      Serial.println("[Storage] Failed to create display message mutex.");
+      return false;
+    }
+  }
   if (isMounted_) {
     Serial.println("[Storage] SD already mounted.");
     return true;
@@ -752,6 +862,40 @@ void PhotoStorage::displaySlideshow() {
   }
 
   const uint32_t now = millis();
+  bool showMessage = false;
+  String messageTitle;
+  String messageBody;
+  uint32_t messageRemainingSeconds = 0;
+  if (promptMutex_ == nullptr) {
+    promptMutex_ = xSemaphoreCreateMutex();
+  }
+  if (promptMutex_ != nullptr && xSemaphoreTake(promptMutex_, pdMS_TO_TICKS(10)) == pdTRUE) {
+    if (userMessageActive_) {
+      if (static_cast<int32_t>(userMessageDeadlineMs_ - now) <= 0) {
+        userMessageActive_ = false;
+      } else {
+        showMessage = true;
+        messageTitle = userMessageTitle_;
+        messageBody = userMessageBody_;
+        const uint32_t elapsedRemainingMs = userMessageDeadlineMs_ - now;
+        messageRemainingSeconds = (elapsedRemainingMs + 999UL) / 1000UL;
+        messageRemainingSeconds =
+            ((messageRemainingSeconds + (kSetupMessageCountdownMs / 1000U) - 1) /
+             (kSetupMessageCountdownMs / 1000U)) *
+            (kSetupMessageCountdownMs / 1000U);
+      }
+    }
+    xSemaphoreGive(promptMutex_);
+  }
+  if (showMessage) {
+    renderUserMessage(messageTitle, messageBody, messageRemainingSeconds);
+    return;
+  }
+  if (gLvMessageOverlay != nullptr) {
+    dismissUserMessageOverlay();
+    lastSlideAtMs_ = 0;
+  }
+
   const uint32_t minimumHoldMs =
       lastPreparationMs_ < kSlideDurationMs ? kSlideDurationMs - lastPreparationMs_ : 0;
   if (lastSlideAtMs_ != 0 && (now - lastSlideAtMs_) < minimumHoldMs) {

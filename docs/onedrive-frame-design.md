@@ -102,6 +102,7 @@ START ──▶ WIFI_CONNECT ──▶ LOAD_TOKEN ──▶ CHECK_TOKEN_VALIDITY
 
 - **START** – Open/create the catalog and reconcile it with files on SD (retries every second until it succeeds), then open the NVS token store.
 - **WIFI_CONNECT** – WiFiManager `autoConnect`; on failure go idle.
+- If setup is required, WiFiManager publishes a full-screen prompt to the display: AP name, password, portal URL, and a 60-second countdown.
 - Wi‑Fi modem sleep is disabled after connection so PHY tracking timers are initialized before Graph/TLS activity and do not require late internal-RAM allocation.
 - **LOAD_TOKEN / CHECK_TOKEN_VALIDITY** – Tokens are restored from NVS, but expiry is not trusted across reboots (`expiresAtMs = 0`), so the first sync after boot always refreshes.
 - **REFRESH_TOKEN_OR_LOGIN** – Try refresh-token grant; if that fails, run the device-code flow. Save tokens on success.
@@ -117,6 +118,7 @@ START ──▶ WIFI_CONNECT ──▶ LOAD_TOKEN ──▶ CHECK_TOKEN_VALIDITY
 - Scopes: `Files.Read offline_access`.
 - Client ID: `CLIENT_ID` macro (default in [FrameConfig.h](../src/FrameConfig.h)); a placeholder all-zero ID disables auth.
 - **Device-code flow:** POST to `/devicecode`, print the message/URL/code to serial, then poll `/token` at the server-provided interval until success, `expires_in` (default 900 s), or a terminal error. `authorization_pending` continues; `slow_down` adds 5 s to the interval.
+- Device-code login publishes the verification URL and code to the same full-screen display overlay. The countdown updates every 10 seconds for 60 seconds, then the slideshow resumes while token polling continues in the background.
 - **Refresh:** `grant_type=refresh_token`; a rotated refresh token replaces the stored one.
 - Access-token expiry is stored as `millis() + expires_in − 60 s`.
 - OAuth POSTs retry transport failures up to 4 times with linear back-off.
@@ -197,6 +199,8 @@ On the first `displaySlideshow()` call:
 5. LVGL is initialized with an 800 × 480 full-screen draw buffer in PSRAM and a black screen background.
 
 The larger bounce buffer and slightly lower pixel clock give the LCD's bounce-buffer refill (a copy from the PSRAM frame buffer) enough slack while the sync task is busy with TLS and SD traffic. Without this, scan-out occasionally underran and showed a one-frame horizontal band or shift. Cost: about 19 KB more internal RAM in total, and refresh drops from about 34 Hz to about 30 Hz.
+
+Setup instructions use a black, opaque, full-screen LVGL overlay in large white text. Wi‑Fi and OAuth code only publish message state; the display task owns all LVGL objects and renders the countdown, which prevents cross-core LVGL access. On timeout, completion, or failure, the overlay is removed and the slideshow resumes immediately if indexed local photos exist.
 
 ### 7.2 Slideshow loop
 

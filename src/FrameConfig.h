@@ -21,7 +21,9 @@ constexpr uint8_t kRtpChipSelectPin = 38;
 constexpr uint32_t kSdSpiFrequencyHz = 4000000UL;
 constexpr bool kSdFormatIfEmpty = true;
 constexpr uint32_t kWifiConnectTimeoutMs = 20000UL;
-constexpr uint32_t kWifiPortalTimeoutMs = 300000UL;
+constexpr uint32_t kWifiPortalTimeoutMs = 60000UL;
+constexpr uint32_t kSetupMessageTimeoutMs = 60000UL;
+constexpr uint32_t kSetupMessageCountdownMs = 10000UL;
 
 constexpr uint32_t kSyncIntervalMs = 3UL * 60UL * 60UL * 1000UL;
 constexpr uint32_t kSlideDurationMs = 10UL * 1000UL;

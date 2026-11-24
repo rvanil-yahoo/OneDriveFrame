@@ -945,6 +945,10 @@ bool GraphClient::authenticateWithDeviceCode(OAuthToken& token) {
     Serial.println("[OAuth] URL: " + verificationUri);
     Serial.println("[OAuth] Code: " + userCode);
   }
+  if (promptCallback_) {
+    String instructions = "On your phone or computer:\nOpen " + verificationUri + "\nEnter code: " + userCode;
+    promptCallback_("Sign in to OneDrive", instructions, kSetupMessageTimeoutMs);
+  }
 
   const uint32_t pollDeadlineMs = millis() + (expiresInSeconds * 1000UL);
   while (millis() < pollDeadlineMs) {
@@ -965,6 +969,9 @@ bool GraphClient::authenticateWithDeviceCode(OAuthToken& token) {
         return false;
       }
       Serial.println("[OAuth] Device-code sign-in completed.");
+      if (clearPromptCallback_) {
+        clearPromptCallback_();
+      }
       return true;
     }
 
@@ -973,6 +980,9 @@ bool GraphClient::authenticateWithDeviceCode(OAuthToken& token) {
       Serial.print("[OAuth] Token polling HTTP ");
       Serial.println(tokenStatus);
       Serial.println(tokenResponse);
+      if (clearPromptCallback_) {
+        clearPromptCallback_();
+      }
       return false;
     }
 
@@ -989,10 +999,16 @@ bool GraphClient::authenticateWithDeviceCode(OAuthToken& token) {
     Serial.print("[OAuth] Device-code flow failed: ");
     Serial.println(errorCode);
     Serial.println(tokenResponse);
+    if (clearPromptCallback_) {
+      clearPromptCallback_();
+    }
     return false;
   }
 
   Serial.println("[OAuth] Device-code flow timed out before authorization completed.");
+  if (clearPromptCallback_) {
+    clearPromptCallback_();
+  }
   return false;
 }
 

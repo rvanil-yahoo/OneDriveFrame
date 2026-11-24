@@ -17,6 +17,16 @@ void OneDriveFrameApp::setup() {
   graphClient_.setCatalog(&photoCatalog_);
   photoStorage_.setCatalog(&photoCatalog_);
   graphClient_.setStorageMutex(photoStorageMutex_);
+  wifiSetupManager_.setPromptCallbacks(
+      [this](const String& title, const String& body, uint32_t timeoutMs) {
+        photoStorage_.requestUserMessage(title, body, timeoutMs);
+      },
+      [this]() { photoStorage_.clearUserMessage(); });
+  graphClient_.setPromptCallbacks(
+      [this](const String& title, const String& body, uint32_t timeoutMs) {
+        photoStorage_.requestUserMessage(title, body, timeoutMs);
+      },
+      [this]() { photoStorage_.clearUserMessage(); });
 
   Serial.println("[Boot] Waiting for mission-critical storage initialization...");
   uint32_t nextRetryLogMs = 0;
