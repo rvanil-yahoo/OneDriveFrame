@@ -83,8 +83,14 @@ String urlEncode(const String& value) {
 
 bool postForm(const String& url, const String& formBody, int& statusCode, String& responseBody) {
   const uint8_t maxRetries = 3U;
+  const uint32_t deadlineMs = millis() + kGraphRetryDeadlineMs;
 
   for (uint8_t attempt = 0; attempt <= maxRetries; ++attempt) {
+    if (static_cast<int32_t>(deadlineMs - millis()) <= 0) {
+      Serial.println("[OAuth] Request retry deadline reached.");
+      statusCode = -1;
+      return false;
+    }
     if (WiFi.status() != WL_CONNECTED) {
       Serial.print("[OAuth] WiFi not connected before POST attempt ");
       Serial.print(attempt + 1);
@@ -98,7 +104,7 @@ bool postForm(const String& url, const String& formBody, int& statusCode, String
 
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(15000);
+    client.setTimeout(kGraphRequestTimeoutMs);
 
     HTTPClient http;
     if (!http.begin(client, url)) {
@@ -106,8 +112,8 @@ bool postForm(const String& url, const String& formBody, int& statusCode, String
       return false;
     }
 
-    http.setTimeout(15000);
-    http.setConnectTimeout(10000);
+    http.setTimeout(kGraphRequestTimeoutMs);
+    http.setConnectTimeout(kGraphConnectTimeoutMs);
     http.setReuse(false);
     http.useHTTP10(true);
     http.addHeader("Connection", "close");
@@ -130,7 +136,11 @@ bool postForm(const String& url, const String& formBody, int& statusCode, String
     Serial.println(")");
 
     if (attempt < maxRetries) {
-      delay(1500UL * (attempt + 1));
+      const int32_t remainingMs = static_cast<int32_t>(deadlineMs - millis());
+      if (remainingMs <= 0) {
+        return false;
+      }
+      delay(std::min<uint32_t>(1500UL * (attempt + 1), static_cast<uint32_t>(remainingMs)));
       continue;
     }
     return false;
@@ -231,8 +241,14 @@ bool getWithBearer(const String& url, const String& token, int& statusCode, Stri
   WiFiClientSecure& client = sessionClient != nullptr ? *sessionClient : standaloneClient;
   HTTPClient& http = sessionHttp != nullptr ? *sessionHttp : standaloneHttp;
   const bool keepAlive = sessionClient != nullptr && sessionHttp != nullptr;
+  const uint32_t deadlineMs = millis() + kGraphRetryDeadlineMs;
 
   for (uint8_t attempt = 0; attempt <= kMaxRetries; ++attempt) {
+    if (static_cast<int32_t>(deadlineMs - millis()) <= 0) {
+      Serial.println("[Graph] Request retry deadline reached.");
+      statusCode = -1;
+      return false;
+    }
     if (WiFi.status() != WL_CONNECTED) {
       Serial.print("[Graph] WiFi not connected before GET attempt ");
       Serial.print(attempt + 1);
@@ -246,15 +262,15 @@ bool getWithBearer(const String& url, const String& token, int& statusCode, Stri
     }
 
     client.setInsecure();
-    client.setTimeout(15000);
+    client.setTimeout(kGraphRequestTimeoutMs);
 
     if (!http.begin(client, url)) {
       Serial.println("[Graph] Failed to initialize HTTPS client.");
       return false;
     }
 
-    http.setTimeout(15000);
-    http.setConnectTimeout(10000);
+    http.setTimeout(kGraphRequestTimeoutMs);
+    http.setConnectTimeout(kGraphConnectTimeoutMs);
     http.setReuse(keepAlive);
     http.useHTTP10(!keepAlive);
     http.addHeader("Connection", keepAlive ? "keep-alive" : "close");
@@ -284,7 +300,11 @@ bool getWithBearer(const String& url, const String& token, int& statusCode, Stri
                     networkError,
                     static_cast<unsigned>(url.length()));
       if (attempt < kMaxRetries) {
-        delay(1500UL * (attempt + 1));
+        const int32_t remainingMs = static_cast<int32_t>(deadlineMs - millis());
+        if (remainingMs <= 0) {
+          return false;
+        }
+        delay(std::min<uint32_t>(1500UL * (attempt + 1), static_cast<uint32_t>(remainingMs)));
         continue;
       }
       return false;
@@ -309,7 +329,11 @@ bool getWithBearer(const String& url, const String& token, int& statusCode, Stri
       Serial.print("/");
       Serial.print(kMaxRetries + 1);
       Serial.println(")");
-      delay(delayMs);
+      const int32_t remainingMs = static_cast<int32_t>(deadlineMs - millis());
+      if (remainingMs <= 0) {
+        return false;
+      }
+      delay(std::min<uint32_t>(delayMs, static_cast<uint32_t>(remainingMs)));
       continue;
     }
 
@@ -602,14 +626,15 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
 
     WiFiClientSecure client;
     client.setInsecure();
+    client.setTimeout(kGraphRequestTimeoutMs);
     HTTPClient http;
     if (!http.begin(client, effectiveUrl)) {
       Serial.println("[Graph] Failed to start download request for: " + photo.filename);
       continue;
     }
 
-    http.setTimeout(20000);
-    http.setConnectTimeout(10000);
+    http.setTimeout(kGraphRequestTimeoutMs);
+    http.setConnectTimeout(kGraphConnectTimeoutMs);
     http.setReuse(false);
     http.useHTTP10(true);
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
@@ -751,7 +776,7 @@ bool GraphClient::downloadNewestPhotos(const OAuthToken& token) {
       } else if (!http.connected()) {
         exitReason = remaining == -1 ? "connection-closed" : "connection-closed-early";
         break;
-      } else if (millis() - lastDataMs > 20000UL) {
+      } else if (millis() - lastDataMs > kGraphRequestTimeoutMs) {
         exitReason = "idle-timeout";
         break;
       } else {

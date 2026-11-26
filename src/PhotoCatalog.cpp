@@ -1,6 +1,7 @@
 #include "PhotoCatalog.h"
 
 #include <SD.h>
+#include <esp_random.h>
 
 extern "C" {
 #include <sqlite3.h>
@@ -560,29 +561,33 @@ bool PhotoCatalog::nextSlideshowPhoto(const String& afterPath, String& path, siz
   const char* nextSql =
       "SELECT local_path FROM photos WHERE local_present=1 "
       "AND (lower(local_path) LIKE '%.jpg' OR lower(local_path) LIKE '%.jpeg') "
-      "AND local_path > ?1 ORDER BY local_path ASC LIMIT 1;";
+      "ORDER BY local_path ASC LIMIT 1 OFFSET ?1;";
   sqlite3_stmt* nextStmt = nullptr;
   rc = sqlite3_prepare_v2(database_, nextSql, -1, &nextStmt, nullptr);
   if (rc != SQLITE_OK) {
     logSqliteError("prepare next slideshow photo", database_, rc);
     return false;
   }
-  bindNullableText(nextStmt, 1, afterPath);
+  size_t offset = count > 0 ? static_cast<size_t>(esp_random() % count) : 0;
+  sqlite3_bind_int64(nextStmt, 1, static_cast<int64_t>(offset));
   rc = sqlite3_step(nextStmt);
-  if (rc == SQLITE_DONE) {
-    sqlite3_finalize(nextStmt);
-    const char* firstSql =
-        "SELECT local_path FROM photos WHERE local_present=1 "
-        "AND (lower(local_path) LIKE '%.jpg' OR lower(local_path) LIKE '%.jpeg') "
-        "ORDER BY local_path ASC LIMIT 1;";
-    rc = sqlite3_prepare_v2(database_, firstSql, -1, &nextStmt, nullptr);
-    if (rc == SQLITE_OK) {
-      rc = sqlite3_step(nextStmt);
-    }
-  }
   if (rc == SQLITE_ROW) {
     const char* localPath = reinterpret_cast<const char*>(sqlite3_column_text(nextStmt, 0));
     path = localPath != nullptr ? localPath : "";
+    if (count > 1 && path == afterPath) {
+      sqlite3_finalize(nextStmt);
+      nextStmt = nullptr;
+      offset = (offset + 1) % count;
+      rc = sqlite3_prepare_v2(database_, nextSql, -1, &nextStmt, nullptr);
+      if (rc == SQLITE_OK) {
+        sqlite3_bind_int64(nextStmt, 1, static_cast<int64_t>(offset));
+        rc = sqlite3_step(nextStmt);
+        if (rc == SQLITE_ROW) {
+          const char* alternatePath = reinterpret_cast<const char*>(sqlite3_column_text(nextStmt, 0));
+          path = alternatePath != nullptr ? alternatePath : "";
+        }
+      }
+    }
   }
   sqlite3_finalize(nextStmt);
   return rc == SQLITE_ROW;

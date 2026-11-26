@@ -102,7 +102,7 @@ START ──▶ WIFI_CONNECT ──▶ LOAD_TOKEN ──▶ CHECK_TOKEN_VALIDITY
 
 - **START** – Open/create the catalog and reconcile it with files on SD (retries every second until it succeeds), then open the NVS token store.
 - **WIFI_CONNECT** – WiFiManager `autoConnect`; on failure go idle.
-- If setup is required, WiFiManager publishes a full-screen prompt to the display: AP name, password, portal URL, and a 60-second countdown.
+- If setup is required, WiFiManager publishes a full-screen prompt to the display: AP name, password, and portal URL. The prompt and portal attempt time out after 10 seconds.
 - Wi‑Fi modem sleep is disabled after connection so PHY tracking timers are initialized before Graph/TLS activity and do not require late internal-RAM allocation.
 - **LOAD_TOKEN / CHECK_TOKEN_VALIDITY** – Tokens are restored from NVS, but expiry is not trusted across reboots (`expiresAtMs = 0`), so the first sync after boot always refreshes.
 - **REFRESH_TOKEN_OR_LOGIN** – Try refresh-token grant; if that fails, run the device-code flow. Save tokens on success.
@@ -118,7 +118,7 @@ START ──▶ WIFI_CONNECT ──▶ LOAD_TOKEN ──▶ CHECK_TOKEN_VALIDITY
 - Scopes: `Files.Read offline_access`.
 - Client ID: `CLIENT_ID` macro (default in [FrameConfig.h](../src/FrameConfig.h)); a placeholder all-zero ID disables auth.
 - **Device-code flow:** POST to `/devicecode`, print the message/URL/code to serial, then poll `/token` at the server-provided interval until success, `expires_in` (default 900 s), or a terminal error. `authorization_pending` continues; `slow_down` adds 5 s to the interval.
-- Device-code login publishes the verification URL and code to the same full-screen display overlay. The countdown updates every 10 seconds for 60 seconds, then the slideshow resumes while token polling continues in the background.
+- Device-code login publishes the verification URL and code to the same full-screen display overlay for 10 seconds, then the slideshow resumes while token polling continues in the background.
 - **Refresh:** `grant_type=refresh_token`; a rotated refresh token replaces the stored one.
 - Access-token expiry is stored as `millis() + expires_in − 60 s`.
 - OAuth POSTs retry transport failures up to 4 times with linear back-off.
@@ -208,7 +208,7 @@ Each display-task step:
 
 1. Run LVGL timers.
 2. Start the next decode early enough that its expected completion lands at the 10-second visible cadence. The delay subtracts the most recent scan/decode duration from `kSlideDurationMs`, so slow JPEG decoding is not added to the hold time.
-3. Query the catalog for the next `local_present` `.jpg` / `.jpeg` path after the current path, wrapping to the beginning when necessary. Before the catalog is initialized at boot, perform a one-time directory scan for the first readable JPEG.
+3. Query the catalog for a random `local_present` `.jpg` / `.jpeg` path, choosing an adjacent random row if the selected path is the current image. Before the catalog is initialized at boot, perform a one-time directory scan for the first readable JPEG.
 4. Render the selected file.
 5. Start the cadence timestamp after rendering completes. Decode time for the following slide happens while the current image remains visible.
 
@@ -220,7 +220,7 @@ A slide log line records scan time, render time, and file count.
 2. Pick the smallest TJpgDec scale (1, 1/2, 1/4, 1/8) that fits within 800 × 480.
 3. Compute an **aspect-preserving** target: landscape images fill the 800-px width, portrait or tall images fill the 480-px height.
 4. Decode into an RGB565 buffer, yielding every ~10 ms.
-5. If needed, nearest-neighbour resize to the exact target size.
+5. If needed, resize to the exact target with bilinear RGB565 filtering. TJpgDec scaling is kept conservative: it is never allowed to decode below the final target dimensions.
 
 ### 7.4 Rendering
 
@@ -262,7 +262,9 @@ From [FrameConfig.h](../src/FrameConfig.h):
 | `kGraphScope` | `Files.Read offline_access` | OAuth scopes |
 | `CLIENT_ID` | built-in default | Entra app (public client) ID; override with `-DCLIENT_ID=...` |
 | `kConfigPortalName` / `kConfigPortalPassword` | `OneDriveFrame Setup` / configured | Wi‑Fi setup AP |
-| `kWifiConnectTimeoutMs` / `kWifiPortalTimeoutMs` | 20 s / 5 min | Wi‑Fi timeouts |
+| `kWifiConnectTimeoutMs` / `kWifiPortalTimeoutMs` | 10 s / 10 s | Wi‑Fi connection and setup-portal timeouts |
+| `kGraphConnectTimeoutMs` / `kGraphRequestTimeoutMs` | 10 s / 20 s | Graph connect timeout and request inactivity timeout |
+| `kGraphRetryDeadlineMs` | 30 s | Total retry budget for an individual Graph/identity request |
 | `kSdSpiFrequencyHz` | 4 MHz | SD SPI clock |
 | `kSdFormatIfEmpty` | `true` | **Formats the card** if the normal mount fails |
 | `kSyncIntervalMs` | 3 h | Time between sync passes |

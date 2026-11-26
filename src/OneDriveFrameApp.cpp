@@ -53,7 +53,7 @@ void OneDriveFrameApp::setup() {
 
   storageReady_.store(storageReady);
   if (storageReady) {
-    Serial.println("[Boot] Local photo storage is ready; slideshow will start immediately.");
+    Serial.println("[Boot] Local photo storage and first slide are ready before WiFi starts.");
   }
 
   TaskHandle_t displayTaskHandle = nullptr;

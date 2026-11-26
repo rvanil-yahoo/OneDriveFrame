@@ -30,7 +30,7 @@ OneDriveFrame is a self-contained photo frame built on a small ESP32-S3 display 
 
 - Microsoft personal-account sign-in through the OAuth device-code flow.
 - Wi-Fi configuration through a captive portal.
-- On-screen Wi-Fi setup and OneDrive sign-in instructions, with a 60-second countdown.
+- On-screen Wi-Fi setup and OneDrive sign-in instructions, with a 10-second timeout.
 - Periodic OneDrive folder sync, with paginated listings.
 - Local JPEG slideshow using an LVGL image widget.
 - Aspect-ratio-preserving resizing and centering on a black background.
@@ -142,7 +142,7 @@ If no saved Wi-Fi connection is available, connect to the **OneDriveFrame Setup*
 
 Watch the serial console for the Microsoft verification URL and device code. Complete sign-in in your browser. The frame saves tokens and attempts to refresh them for later syncs.
 
-The Wi-Fi portal and OneDrive device-code instructions are also shown full-screen in large white text. A countdown updates every ten seconds for one minute. Setup messages temporarily replace the slideshow; when time expires, the current local catalog resumes automatically if photos are available. You do not need a serial monitor for normal setup.
+The Wi-Fi portal and OneDrive device-code instructions are also shown full-screen in large white text for 10 seconds. Setup messages temporarily replace the slideshow; when time expires, the current local catalog resumes automatically if photos are available. The portal and Wi-Fi connection attempts also stop after 10 seconds. Graph requests time out instead of blocking indefinitely. You do not need a serial monitor for normal setup.
 
 ## Code overview
 

@@ -102,9 +102,9 @@ uint8_t chooseJpegScale(uint16_t sourceW, uint16_t sourceH, int frameW, int fram
 
   uint8_t scale = 0;
   while (scale < 3) {
-    const uint16_t scaledW = sourceW >> scale;
-    const uint16_t scaledH = sourceH >> scale;
-    if (scaledW <= static_cast<uint16_t>(panelW) && scaledH <= static_cast<uint16_t>(panelH)) {
+    const uint16_t nextScaleW = sourceW >> (scale + 1);
+    const uint16_t nextScaleH = sourceH >> (scale + 1);
+    if (nextScaleW < static_cast<uint16_t>(panelW) || nextScaleH < static_cast<uint16_t>(panelH)) {
       break;
     }
     ++scale;
@@ -341,17 +341,55 @@ void dismissUserMessageOverlay() {
   }
 }
 
-void resizeRgb565Nearest(const uint16_t* src, uint16_t srcW, uint16_t srcH, uint16_t dstW, uint16_t dstH, uint16_t* dst) {
+void resizeRgb565Bilinear(const uint16_t* src, uint16_t srcW, uint16_t srcH, uint16_t dstW, uint16_t dstH,
+                          uint16_t* dst) {
   if (src == nullptr || dst == nullptr || srcW == 0 || srcH == 0 || dstW == 0 || dstH == 0) {
     return;
   }
 
   for (uint16_t y = 0; y < dstH; ++y) {
-    const uint16_t srcY = static_cast<uint16_t>((static_cast<uint32_t>(y) * srcH) / dstH);
-    const size_t srcYIndex = static_cast<size_t>(srcY) * srcW;
+    const uint32_t srcYFixed = dstH > 1
+                                   ? static_cast<uint32_t>(static_cast<uint64_t>(y) *
+                                                           (static_cast<uint64_t>(srcH - 1) << 16) /
+                                                           (dstH - 1))
+                                   : 0;
+    const uint16_t srcY0 = static_cast<uint16_t>(srcYFixed >> 16);
+    const uint16_t srcY1 = srcY0 + 1 < srcH ? srcY0 + 1 : srcY0;
+    const uint32_t yFrac = srcYFixed & 0xFFFFU;
     for (uint16_t x = 0; x < dstW; ++x) {
-      const uint16_t srcX = static_cast<uint16_t>((static_cast<uint32_t>(x) * srcW) / dstW);
-      dst[static_cast<size_t>(y) * dstW + x] = src[srcYIndex + srcX];
+      const uint32_t srcXFixed = dstW > 1
+                                     ? static_cast<uint32_t>(static_cast<uint64_t>(x) *
+                                                             (static_cast<uint64_t>(srcW - 1) << 16) /
+                                                             (dstW - 1))
+                                     : 0;
+      const uint16_t srcX0 = static_cast<uint16_t>(srcXFixed >> 16);
+      const uint16_t srcX1 = srcX0 + 1 < srcW ? srcX0 + 1 : srcX0;
+      const uint32_t xFrac = srcXFixed & 0xFFFFU;
+
+      const uint16_t pixels[4] = {
+          src[static_cast<size_t>(srcY0) * srcW + srcX0],
+          src[static_cast<size_t>(srcY0) * srcW + srcX1],
+          src[static_cast<size_t>(srcY1) * srcW + srcX0],
+          src[static_cast<size_t>(srcY1) * srcW + srcX1],
+      };
+      const uint32_t inverseX = 0x10000U - xFrac;
+      const uint32_t inverseY = 0x10000U - yFrac;
+      uint16_t channels[3] = {};
+      const uint8_t shifts[3] = {11, 5, 0};
+      const uint8_t masks[3] = {0x1F, 0x3F, 0x1F};
+      for (uint8_t channel = 0; channel < 3; ++channel) {
+        const uint32_t p00 = (pixels[0] >> shifts[channel]) & masks[channel];
+        const uint32_t p01 = (pixels[1] >> shifts[channel]) & masks[channel];
+        const uint32_t p10 = (pixels[2] >> shifts[channel]) & masks[channel];
+        const uint32_t p11 = (pixels[3] >> shifts[channel]) & masks[channel];
+        const uint32_t top = p00 * inverseX + p01 * xFrac;
+        const uint32_t bottom = p10 * inverseX + p11 * xFrac;
+        channels[channel] = static_cast<uint16_t>(
+            (static_cast<uint64_t>(top) * inverseY + static_cast<uint64_t>(bottom) * yFrac + 0x80000000ULL) >>
+            32);
+      }
+      dst[static_cast<size_t>(y) * dstW + x] =
+          static_cast<uint16_t>((channels[0] << 11) | (channels[1] << 5) | channels[2]);
     }
     if ((y % 32) == 0) {
       vTaskDelay(1);
@@ -614,7 +652,6 @@ bool PhotoStorage::decodeJpegToRgb565(const String& sourcePath, uint16_t targetW
     return false;
   }
 
-  const uint8_t jpegScale = chooseJpegScale(srcW, srcH, targetW, targetH);
   if (srcW == 0 || srcH == 0) {
     Serial.println("[Display] Invalid JPEG dimensions.");
     return false;
@@ -624,8 +661,11 @@ bool PhotoStorage::decodeJpegToRgb565(const String& sourcePath, uint16_t targetW
   } else {
     targetW = static_cast<uint16_t>(std::max<uint32_t>(1U, static_cast<uint32_t>(srcW) * targetH / srcH));
   }
+  const uint8_t jpegScale = chooseJpegScale(srcW, srcH, targetW, targetH);
   const uint16_t scaledW = scaledDimension(srcW, jpegScale);
   const uint16_t scaledH = scaledDimension(srcH, jpegScale);
+  Serial.printf("[Display] Decode dimensions: source=%ux%u scale=1/%u decoded=%ux%u output=%ux%u\n", srcW, srcH,
+                1U << jpegScale, scaledW, scaledH, targetW, targetH);
 
   pixels = PixelBuffer(static_cast<uint16_t*>(
       heap_caps_malloc(static_cast<size_t>(scaledW) * scaledH * sizeof(uint16_t),
@@ -700,7 +740,7 @@ bool PhotoStorage::decodeJpegToRgb565(const String& sourcePath, uint16_t targetW
     return false;
   }
 
-  resizeRgb565Nearest(pixels.get(), scaledW, scaledH, targetW, targetH, resized.get());
+  resizeRgb565Bilinear(pixels.get(), scaledW, scaledH, targetW, targetH, resized.get());
   pixels = std::move(resized);
   outW = targetW;
   outH = targetH;
